@@ -1,10 +1,14 @@
 # ESP32 Polar H10 HR Receiver
 
-Real-time heart rate logging from a Polar H10 worn on the field, relayed through an ESP32 over WiFi to a Raspberry Pi at home. Built for football practice — eventual goal is to pair HR data with accelerometer data to get recovery and exertion insights.
+Real-time heart rate logging from a Polar H10 worn on the field, relayed through an ESP32 to a Raspberry Pi at home **over the internet via HiveMQ Cloud (MQTT)**. Built for football practice — eventual goal is to pair HR data with accelerometer data to get recovery and exertion insights.
 
 ```
-Polar H10 ──BLE──► ESP32 (on body) ──WiFi──► Raspberry Pi (at home)
+Polar H10 ──BLE──► ESP32 (on body) ──MQTT/TLS──► HiveMQ Cloud ──MQTT──► Raspberry Pi ──► SQLite
+             HR notifications        publish              subscribe        (at home)      hr_data.db
+                                     topic: polar/hr
 ```
+
+Because both the ESP32 and the Pi connect **out** to HiveMQ Cloud, they no longer need to be on the same WiFi. The ESP32 can be on a phone hotspot at practice while the Pi sits at home — no port forwarding, no same-network requirement.
 
 ---
 
@@ -16,6 +20,7 @@ Polar H10 ──BLE──► ESP32 (on body) ──WiFi──► Raspberry Pi (a
 | **Heart rate sensor** | Polar H10 | |
 | **Battery** | LiPo battery | [Buy](https://www.amazon.com/dp/B0FZSYM9T2?ref=ppx_yo2ov_dt_b_fed_asin_title&th=1) |
 | **Server** | Raspberry Pi 1GB | |
+| **Broker** | HiveMQ Cloud (free tier) | [console](https://console.hivemq.cloud) |
 
 <img src="PolarH10.png" width="300" alt="Polar H10"/>
 <img src="RasberryPi-1G.jpg" width="300" alt="Raspberry Pi 1GB"/>
@@ -28,107 +33,142 @@ Polar H10 ──BLE──► ESP32 (on body) ──WiFi──► Raspberry Pi (a
 esp32/                      — PlatformIO project (flashed to the ESP32)
   src/
     main.cpp
-    config.h                — WiFi credentials and tuning (edit this)
+    config.h                — WiFi + HiveMQ credentials (gitignored, edit this)
 Raspberrypi/
-  hr_receiver/              — Python server that runs on the Pi
+  hr_receiver/              — Python MQTT subscriber that runs on the Pi
     hr_receiver.py
     install.sh              — one-time setup script
-    requirements.txt
+    requirements.txt        — paho-mqtt
     hr_receiver.service     — systemd unit (auto-start on boot)
+    mqtt.env.example        — template for the Pi's credentials (copy to mqtt.env)
 data/
   hr_data.db                — SQLite database (copied from Pi)
   analyze.py                — analysis script
+deploy-pi.sh                — push Pi code changes from Mac + restart (same network)
+pi-server.sh                — start/stop/status the Pi service from Mac (same network)
 ```
 
 ---
 
 ## Setup
 
-### Step 1 — Configure WiFi credentials on the ESP32
+### Step 1 — Get HiveMQ Cloud credentials
 
-Edit `esp32/src/config.h`:
+In the [HiveMQ Cloud console](https://console.hivemq.cloud), open your cluster and note four things:
+
+- **Host** — e.g. `xxxxx.s1.eu.hivemq.cloud` (the "MQTT URL", no `https://`)
+- **Port** — `8883` (TLS)
+- **Username** / **Password** — create one under **Access Management → Credentials** with **Publish and Subscribe** permission
+
+### Step 2 — Configure the ESP32
+
+Edit `esp32/src/config.h` (gitignored):
 
 ```c
+// WiFi — personal network tried first, eduroam as fallback
 #define HOME_SSID   "your wifi name"
 #define HOME_PASS   "your wifi password"
+
+// HiveMQ Cloud
+#define MQTT_HOST   "xxxxx.s1.eu.hivemq.cloud"
+#define MQTT_PORT   8883
+#define MQTT_USER   "your_username"
+#define MQTT_PASS   "your_password"
+#define MQTT_TOPIC  "polar/hr"
 ```
 
-There is also an eduroam (WPA2-Enterprise) fallback — fill in those fields if you want it to work on campus.
-
-### Step 2 — Flash the ESP32
-
-Open the `esp32/` folder in PlatformIO and click **Upload**, or run:
+### Step 3 — Flash the ESP32
 
 ```bash
 cd esp32
 pio run --target upload
 ```
 
-### Step 3 — Set up the Raspberry Pi receiver
+### Step 4 — Set up the Raspberry Pi receiver
 
-SSH into your Pi:
+Copy the code to the Pi (from your Mac, on the same network):
+
+```bash
+./deploy-pi.sh
+```
+
+Then SSH in and run the one-time installer:
 
 ```bash
 ssh carter@pi4server.local
-```
-
-Clone or copy the project, then run the install script:
-
-```bash
 cd ~/projects/python/esp-polar/hr_receiver
-bash install.sh
+./install.sh          # creates the venv, installs paho-mqtt, sets up mqtt.env + systemd service
+nano mqtt.env         # fill in the SAME 4 HiveMQ values as config.h, then save
+sudo systemctl restart hr_receiver
 ```
 
-This will:
-1. Create a Python virtual environment
-2. Install dependencies (`zeroconf`, etc.)
-3. Optionally install a systemd service so the receiver starts automatically on boot
+> `mqtt.env` holds your credentials and is **gitignored** — it lives only on the Pi and is never overwritten by `deploy-pi.sh`.
 
 ---
 
-## Running
+## Running & Controlling the Pi Service
 
-### On the Pi
+The receiver runs as a systemd service (`hr_receiver`) and auto-starts on boot. Three ways to control it depending on where you are:
 
-If you set up the systemd service, it starts automatically — nothing to do.
-
-To start manually:
+### On your Mac, same network — `pi-server.sh`
 
 ```bash
-cd ~/projects/python/esp-polar/hr_receiver
-source .venv/bin/activate
-python hr_receiver.py
+./pi-server.sh start      # start the receiver
+./pi-server.sh stop       # stop it
+./pi-server.sh restart    # restart it
+./pi-server.sh status     # is it running?
+./pi-server.sh logs       # follow live logs (Ctrl-C to exit)
 ```
 
-Check service status:
+Run these from the project root. If you're **not on the same WiFi as the Pi**, it prints a clear "can't reach the Pi — you must be on the same network" message.
+
+### From anywhere (field, phone) — Raspberry Pi Connect
+
+1. Open **[connect.raspberrypi.com](https://connect.raspberrypi.com)** → your Pi (**pi4server**) → **Remote Shell**
+2. Type any of these shortcuts (they work from any directory):
+
+| Command | Does |
+|---|---|
+| `hr-start` | start the receiver |
+| `hr-stop` | stop it |
+| `hr-restart` | restart it |
+| `hr-status` | is it running? |
+| `hr-logs` | follow live data (Ctrl-C to exit) |
+
+This tunnels through your home router, so it works over the internet — no same-network requirement.
+
+### Directly on the Pi (raw systemctl)
 
 ```bash
-sudo systemctl status hr_receiver
-```
-
-Follow live logs:
-
-```bash
+sudo systemctl start|stop|restart|status hr_receiver
 sudo journalctl -u hr_receiver -f
 ```
 
-Stop the service:
+---
+
+## Deploying Code Changes to the Pi
+
+After editing anything in `Raspberrypi/hr_receiver/`, push it from your Mac (same network):
 
 ```bash
-sudo systemctl stop hr_receiver
+./deploy-pi.sh
 ```
 
-### On the ESP32
+This rsyncs the folder to `/home/carter/projects/python/esp-polar/hr_receiver`, reinstalls Python deps, and restarts the service. It **never** overwrites the Pi's `.venv`, `hr_data.db`, or `mqtt.env`.
 
-Power it on. It will:
-1. Connect to WiFi (tries home network first, falls back to eduroam)
-2. Find the Pi automatically via mDNS (`hr-server.local`) — no IP config needed
-3. Scan for the Polar H10 over BLE
-4. Stream HR data to the Pi in batches every 30 seconds
+> If you edit `hr_receiver.service` itself, re-register the systemd unit once on the Pi (re-run `./install.sh` or the `sed | sudo tee` step) — `deploy-pi.sh` copies files and restarts, but doesn't reinstall the unit.
 
 ---
 
-## Status Indicators (backlight)
+## On the ESP32
+
+Power it on. It will:
+1. Connect to WiFi (tries home network first, falls back to eduroam)
+2. Connect to HiveMQ Cloud over TLS (port 8883)
+3. Scan for the Polar H10 over BLE
+4. Publish HR data to the `polar/hr` topic in batches every 30 seconds
+
+### Status Indicators (backlight)
 
 | Backlight | Meaning |
 |---|---|
@@ -138,11 +178,13 @@ Power it on. It will:
 | Slow blink | Scanning for Polar H10 |
 | Off | Connected to Polar, recording |
 
----
+### Captive Portal status page
 
-## Captive Portal
+The ESP32 runs an open WiFi access point (`ESP32-Polar`). Connect to it from a phone or laptop to see a live status page: battery, BLE connection, current BPM, and an **MQTT Broker** card that shows **"Connected to MQTT ✓"** (or "Not connected to MQTT" if it drops).
 
-The ESP32 also runs an open WiFi access point (`ESP32-Polar`). Connect to it from any phone or laptop to see a live status page showing battery, BLE connection, current BPM, and receiver status.
+### Verify without the Pi
+
+In the HiveMQ console there's a built-in **Web Client** — log in with your credentials, subscribe to `polar/hr`, and you'll see the heart-rate JSON arrive every ~30s. Confirms the ESP32→cloud half independently of the Pi.
 
 ---
 
@@ -155,8 +197,6 @@ HR readings are saved to `hr_data.db` (SQLite) on the Pi with:
 - `rr_ms` — RR intervals (JSON array, ms)
 
 ### Copy data from the Pi to your Mac
-
-Run from your Mac terminal (not SSH):
 
 ```bash
 scp carter@pi4server.local:~/projects/python/esp-polar/hr_receiver/hr_data.db data/
@@ -171,3 +211,10 @@ python analyze.py
 ```
 
 Prints key metrics (avg/min/max BPM, RR intervals, duration) and shows a BPM-over-time graph.
+
+---
+
+## Security Notes
+
+- `config.h` and `mqtt.env` hold credentials and are **gitignored**.
+- The ESP32 uses TLS but currently skips server-certificate validation (`setInsecure()` in `main.cpp`) — encrypted, but not pinned to HiveMQ's CA. Fine for a hobby setup; can be hardened by embedding the HiveMQ root CA.
