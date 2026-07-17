@@ -10,11 +10,12 @@ Polar H10 ──BLE──► ESP32 (on body) ──WiFi──► Raspberry Pi (a
 
 ## Hardware
 
-| Part | Details |
-|---|---|
-| **ESP32** | LilyGo T-Display-S3 |
-| **Heart rate sensor** | Polar H10 |
-| **Server** | Raspberry Pi 1GB |
+| Part | Details | Link |
+|---|---|---|
+| **ESP32** | LilyGo T-Display-S3 | [Buy](https://lilygo.cc/en-us/products/t-display-s3?srsltid=AfmBOorAvhIBYAfBdJZUqVd6M9FYRvfz8ES51SflbB1JjWLCmOi4rh36) |
+| **Heart rate sensor** | Polar H10 | |
+| **Battery** | LiPo battery | [Buy](https://www.amazon.com/dp/B0FZSYM9T2?ref=ppx_yo2ov_dt_b_fed_asin_title&th=1) |
+| **Server** | Raspberry Pi 1GB | |
 
 <img src="PolarH10.png" width="300" alt="Polar H10"/>
 <img src="RasberryPi-1G.jpg" width="300" alt="Raspberry Pi 1GB"/>
