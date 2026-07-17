@@ -5,8 +5,11 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import json
 import socket
 import sqlite3
+import threading
 from datetime import datetime
 from pathlib import Path
+
+from zeroconf import ServiceInfo, Zeroconf
 
 PORT = 8765
 DB_PATH = Path(__file__).parent / "hr_data.db"
@@ -25,12 +28,26 @@ def init_db(conn):
     conn.commit()
 
 
+esp_seen = False
+
 class HRHandler(BaseHTTPRequestHandler):
     def do_POST(self):
+        global esp_seen
+        ts = datetime.now().strftime("%H:%M:%S")
+        client_ip = self.client_address[0]
+
+        if self.path == "/hello":
+            esp_seen = True
+            print(f"[{ts}] ESP32 connected from {client_ip} — waiting for batches...")
+            self._respond(200, {"ok": True})
+            return
+
         if self.path != "/hr":
             self.send_response(404)
             self.end_headers()
             return
+
+        print(f"[{ts}] Receiving batch...")
 
         length = int(self.headers.get("Content-Length", 0))
         try:
@@ -41,9 +58,8 @@ class HRHandler(BaseHTTPRequestHandler):
 
         readings = data.get("readings", [])
         received = datetime.now().isoformat(timespec="seconds")
-        ts = datetime.now().strftime("%H:%M:%S")
 
-        print(f"\n[{ts}] Batch — {len(readings)} reading(s):")
+        print(f"[{ts}] Batch — {len(readings)} reading(s):")
         with sqlite3.connect(DB_PATH) as conn:
             for r in readings:
                 bpm    = r["bpm"]
@@ -77,18 +93,44 @@ class HRHandler(BaseHTTPRequestHandler):
         pass
 
 
+def get_local_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
 if __name__ == "__main__":
     with sqlite3.connect(DB_PATH) as conn:
         init_db(conn)
 
-    try:
-        local_ip = socket.gethostbyname(socket.gethostname())
-    except Exception:
-        local_ip = "127.0.0.1"
+    local_ip = get_local_ip()
 
-    print(f"HR receiver listening on port {PORT}")
-    print(f"Set SERVER_URL in src/config.h to:  http://{local_ip}:{PORT}/hr")
+    # Advertise as hr-server.local via mDNS so ESP32 can find us automatically
+    zc = Zeroconf()
+    info = ServiceInfo(
+        "_http._tcp.local.",
+        "hr-server._http._tcp.local.",
+        addresses=[socket.inet_aton(local_ip)],
+        port=PORT,
+        properties={},
+        server="hr-server.local.",
+    )
+    zc.register_service(info, cooperating_responders=True)
+
+    print(f"HR receiver listening on {local_ip}:{PORT}")
+    print(f"Advertising as hr-server.local (mDNS) — no IP config needed on ESP32")
     print(f"Saving data to: {DB_PATH}\n")
-    print("Waiting for batches from the ESP32...\n")
+    print("Waiting for connection from ESP32...\n")
 
-    HTTPServer(("0.0.0.0", PORT), HRHandler).serve_forever()
+    try:
+        server = HTTPServer(("0.0.0.0", PORT), HRHandler)
+        server.allow_reuse_address = True
+        server.serve_forever()
+    finally:
+        zc.unregister_service(info)
+        zc.close()
