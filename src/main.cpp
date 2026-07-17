@@ -1,8 +1,10 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <ESPmDNS.h>
+#include <DNSServer.h>
 #include <esp_eap_client.h>
 #include <HTTPClient.h>
+#include <WebServer.h>
 #include <NimBLEDevice.h>
 #include <ArduinoJson.h>
 #include "config.h"
@@ -23,6 +25,133 @@ static volatile bool  doConnect = false;
 static NimBLEAddress  polarAddr;
 static NimBLEClient*  pClient   = nullptr;
 static bool           connected = false;
+
+// Live state exposed to the web server
+static volatile uint8_t  lastBPM         = 0;
+static volatile uint32_t lastBPMTime_ms  = 0;
+static bool              receiverOk      = false;
+static uint32_t          lastPostTime_ms = 0;
+
+static WebServer  webServer(80);
+static DNSServer  dnsServer;
+
+// ── Battery ───────────────────────────────────────────────────────────────────
+static int readBatteryPercent() {
+    uint32_t mv = analogReadMilliVolts(PIN_BAT_ADC) * 2;  // 1:2 divider
+    if (mv <= 3000) return 0;
+    if (mv >= 4200) return 100;
+    return (int)((mv - 3000) * 100 / 1200);
+}
+
+// ── Status page HTML ──────────────────────────────────────────────────────────
+static const char INDEX_HTML[] = R"html(<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32 Polar</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px}
+  h1{color:#58a6ff;margin-bottom:20px;font-size:1.4em}
+  .card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;margin-bottom:12px}
+  .label{font-size:.7em;color:#8b949e;text-transform:uppercase;letter-spacing:.1em;margin-bottom:6px}
+  .value{font-size:1.1em}
+  .on{color:#3fb950}.off{color:#f85149}.dim{color:#8b949e}
+  #bpm{font-size:3.5em;font-weight:bold;color:#58a6ff;line-height:1}
+  #bpm-unit{font-size:.9em;color:#8b949e;margin-top:4px}
+  .bat-bar{height:8px;background:#30363d;border-radius:4px;margin-top:8px;overflow:hidden}
+  .bat-fill{height:100%;border-radius:4px;transition:width .5s}
+</style>
+</head>
+<body>
+<h1>ESP32 Polar H10</h1>
+<div class="card">
+  <div class="label">Battery</div>
+  <div class="value" id="bat">—</div>
+  <div class="bat-bar"><div class="bat-fill" id="bat-fill" style="width:0%"></div></div>
+</div>
+<div class="card">
+  <div class="label">Bluetooth</div>
+  <div class="value" id="ble">—</div>
+</div>
+<div class="card" id="hr-card" style="display:none">
+  <div class="label">Heart Rate</div>
+  <div id="bpm">—</div>
+  <div id="bpm-unit"></div>
+</div>
+<div class="card">
+  <div class="label">HR Receiver</div>
+  <div class="value" id="recv">—</div>
+</div>
+<script>
+async function tick(){
+  try{
+    const d=await(await fetch('/status')).json();
+
+    // Battery
+    const batEl=document.getElementById('bat');
+    const fill=document.getElementById('bat-fill');
+    const pct=d.battery_pct;
+    batEl.textContent=pct+'%';
+    fill.style.width=pct+'%';
+    fill.style.background=pct>50?'#3fb950':pct>20?'#d29922':'#f85149';
+
+    // BLE
+    const ble=document.getElementById('ble');
+    const hr=document.getElementById('hr-card');
+    const bpm=document.getElementById('bpm');
+    const unit=document.getElementById('bpm-unit');
+    if(d.ble_connected){
+      ble.textContent='Connected ✓';ble.className='value on';
+      hr.style.display='block';
+      bpm.textContent=d.bpm;
+      const age=Math.round(d.bpm_age_ms/1000);
+      unit.textContent=age<5?'BPM • live':'BPM • '+age+'s ago';
+    } else {
+      ble.textContent='Scanning for Polar…';ble.className='value off';
+      hr.style.display='none';
+    }
+
+    // HR receiver
+    const recv=document.getElementById('recv');
+    if(d.receiver_ok){
+      const sec=Math.round(d.last_post_ms/1000);
+      recv.textContent='Running ✓  (last batch '+sec+'s ago)';recv.className='value on';
+    } else {
+      recv.textContent=d.server_url?'Unreachable':'Not found';recv.className='value off';
+    }
+  }catch(e){}
+}
+tick();setInterval(tick,1000);
+</script>
+</body>
+</html>)html";
+
+// ── Web server handlers ───────────────────────────────────────────────────────
+static void handleRoot() {
+    webServer.send(200, "text/html", INDEX_HTML);
+}
+
+static void handleStatus() {
+    JsonDocument doc;
+    doc["ble_connected"] = connected;
+    doc["bpm"]           = (int)lastBPM;
+    doc["bpm_age_ms"]    = connected ? (int32_t)(millis() - lastBPMTime_ms) : -1;
+    doc["receiver_ok"]   = receiverOk;
+    doc["last_post_ms"]  = receiverOk ? (int32_t)(millis() - lastPostTime_ms) : -1;
+    doc["server_url"]    = serverURL;
+    doc["battery_pct"]   = readBatteryPercent();
+    String out;
+    serializeJson(doc, out);
+    webServer.send(200, "application/json", out);
+}
+
+// Captive portal: redirect every unknown path to the status page
+static void handleCaptive() {
+    webServer.sendHeader("Location", "http://192.168.4.1/", true);
+    webServer.send(302, "text/plain", "");
+}
 
 // ── HR notification callback (runs in NimBLE task) ───────────────────────────
 static void onHRNotify(NimBLERemoteCharacteristic*, uint8_t* data, size_t len, bool) {
@@ -51,14 +180,16 @@ static void onHRNotify(NimBLERemoteCharacteristic*, uint8_t* data, size_t len, b
         }
     }
 
-    xQueueSend(hrQueue, &r, 0);   // non-blocking; drop oldest if full
+    lastBPM        = r.bpm;
+    lastBPMTime_ms = r.t_ms;
+
+    xQueueSend(hrQueue, &r, 0);
     Serial.printf("[HR] %d BPM\n", r.bpm);
 }
 
 // ── Backlight / status LED ────────────────────────────────────────────────────
-static constexpr int PIN_BL = 38;   // T-Display-S3 backlight
+static constexpr int PIN_BL = 38;
 
-// Quick blinks then stay on (used for "connected" confirmation)
 static void flashOnBL(int times = 3) {
     for (int i = 0; i < times; i++) {
         digitalWrite(PIN_BL, LOW);  delay(80);
@@ -117,7 +248,7 @@ static bool connectToPolar() {
     chr->subscribe(true, onHRNotify);
     connected = true;
     Serial.println("[BLE] Subscribed to HR notifications");
-    digitalWrite(PIN_BL, LOW);     // backlight off = Polar connected, running
+    digitalWrite(PIN_BL, LOW);
     return true;
 }
 
@@ -150,30 +281,50 @@ static void sendBatch() {
     int code = http.POST(body);
     http.end();
 
-    if (code > 0) {
+    if (code > 0 && code < 300) {
+        receiverOk      = true;
+        lastPostTime_ms = millis();
         Serial.printf("[WiFi] Sent %d readings → HTTP %d\n", count, code);
     } else {
+        receiverOk = false;
         Serial.printf("[WiFi] POST failed: %s\n", http.errorToString(code).c_str());
     }
+}
+
+// ── Start AP + captive portal DNS ────────────────────────────────────────────
+static void startAP() {
+    WiFi.softAP(AP_SSID);
+    IPAddress apIP = WiFi.softAPIP();
+    // DNS: answer every hostname with the AP IP so captive portal triggers
+    dnsServer.start(53, "*", apIP);
+    Serial.printf("[AP] %s  →  http://%s\n", AP_SSID, apIP.toString().c_str());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 void setup() {
     pinMode(15, OUTPUT);
-    digitalWrite(15, HIGH);         // PWR_ON — gates LCD power rail on battery
+    digitalWrite(15, HIGH);
 
     pinMode(PIN_BL, OUTPUT);
-    digitalWrite(PIN_BL, HIGH);     // backlight on immediately — power indicator
+    digitalWrite(PIN_BL, HIGH);
 
     Serial.begin(115200);
     delay(1000);
 
     hrQueue = xQueueCreate(QUEUE_LEN, sizeof(HRReading));
 
-    // Try personal network first (10 s), then fall back to enterprise
-    // Slow blink while connecting to WiFi
+    // Start AP + captive portal immediately
+    WiFi.mode(WIFI_AP_STA);
+    startAP();
+
+    webServer.on("/",       handleRoot);
+    webServer.on("/status", handleStatus);
+    webServer.onNotFound(handleCaptive);   // any other path → redirect to portal
+    webServer.begin();
+    Serial.println("[Web] Status server up on AP");
+
+    // Try personal network first (10 s)
     Serial.print("[WiFi] Trying personal network");
-    WiFi.mode(WIFI_STA);
     WiFi.begin(HOME_SSID, HOME_PASS);
     {
         bool bl = true;
@@ -188,6 +339,9 @@ void setup() {
         Serial.print("\n[WiFi] Trying eduroam");
         WiFi.disconnect(true);
         delay(500);
+        // Restore AP+STA after disconnect(true) tears down WiFi
+        WiFi.mode(WIFI_AP_STA);
+        startAP();
         esp_eap_client_set_identity((uint8_t*)ENT_IDENTITY, strlen(ENT_IDENTITY));
         esp_eap_client_set_username((uint8_t*)ENT_USER,     strlen(ENT_USER));
         esp_eap_client_set_password((uint8_t*)ENT_PASS,     strlen(ENT_PASS));
@@ -202,9 +356,8 @@ void setup() {
     }
 
     Serial.printf("\n[WiFi] IP: %s\n", WiFi.localIP().toString().c_str());
-    flashOnBL();    // quick blinks then stay on = WiFi connected
+    flashOnBL();
 
-    // Resolve hr-server.local via mDNS
     MDNS.begin("esp32-polar");
     Serial.print("[mDNS] Resolving hr-server.local");
     IPAddress serverIP;
@@ -219,11 +372,11 @@ void setup() {
         serverURL = "http://" + serverIP.toString() + ":" + String(SERVER_PORT) + "/hr";
         Serial.printf("\n[mDNS] Server: %s\n", serverURL.c_str());
 
-        // Ping the server so it knows we're online before the first batch
         HTTPClient http;
         http.begin("http://" + serverIP.toString() + ":" + String(SERVER_PORT) + "/hello");
-        http.POST("");
+        int code = http.POST("");
         http.end();
+        if (code > 0) { receiverOk = true; lastPostTime_ms = millis(); }
     }
 
     NimBLEDevice::init("ESP32-Polar");
@@ -241,6 +394,9 @@ static uint32_t lastBLTick = 0;
 static bool     blState    = false;
 
 void loop() {
+    dnsServer.processNextRequest();
+    webServer.handleClient();
+
     if (doConnect) {
         doConnect = false;
         connectToPolar();
@@ -251,7 +407,6 @@ void loop() {
             NimBLEDevice::getScan()->start(0, false);
             Serial.println("[BLE] Restarted scan");
         }
-        // Slow blink while scanning for Polar
         uint32_t now = millis();
         if (now - lastBLTick >= 600) {
             lastBLTick = now;
