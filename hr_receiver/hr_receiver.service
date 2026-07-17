@@ -1,0 +1,14 @@
+[Unit]
+Description=HR Receiver for ESP32 Polar H10
+After=network.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__DIR__
+ExecStart=__DIR__/.venv/bin/python3 __DIR__/hr_receiver.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
