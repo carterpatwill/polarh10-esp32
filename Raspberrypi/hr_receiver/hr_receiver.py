@@ -1,17 +1,32 @@
 #!/usr/bin/env python3
-"""Receives HR batches from the ESP32, prints them, and saves to hr_data.db (SQLite)."""
+"""Subscribes to HR batches from HiveMQ Cloud, prints them, and saves to hr_data.db (SQLite).
 
-from http.server import HTTPServer, BaseHTTPRequestHandler
+Config comes from environment variables so credentials aren't hard-coded here.
+Set them to match esp32/src/config.h before running, e.g.:
+
+    export MQTT_HOST="YOUR-CLUSTER.s1.eu.hivemq.cloud"
+    export MQTT_PORT=8883
+    export MQTT_USER="YOUR_MQTT_USERNAME"
+    export MQTT_PASS="YOUR_MQTT_PASSWORD"
+    export MQTT_TOPIC="polar/hr"
+"""
+
 import json
-import socket
+import os
 import sqlite3
-import threading
+import ssl
+import sys
 from datetime import datetime
 from pathlib import Path
 
-from zeroconf import ServiceInfo, Zeroconf
+import paho.mqtt.client as mqtt
 
-PORT = 8765
+MQTT_HOST  = os.environ.get("MQTT_HOST",  "YOUR-CLUSTER.s1.eu.hivemq.cloud")
+MQTT_PORT  = int(os.environ.get("MQTT_PORT", "8883"))
+MQTT_USER  = os.environ.get("MQTT_USER",  "YOUR_MQTT_USERNAME")
+MQTT_PASS  = os.environ.get("MQTT_PASS",  "YOUR_MQTT_PASSWORD")
+MQTT_TOPIC = os.environ.get("MQTT_TOPIC", "polar/hr")
+
 DB_PATH = Path(__file__).parent / "hr_data.db"
 
 
@@ -28,109 +43,64 @@ def init_db(conn):
     conn.commit()
 
 
-esp_seen = False
-
-class HRHandler(BaseHTTPRequestHandler):
-    def do_POST(self):
-        global esp_seen
-        ts = datetime.now().strftime("%H:%M:%S")
-        client_ip = self.client_address[0]
-
-        if self.path == "/hello":
-            esp_seen = True
-            print(f"[{ts}] ESP32 connected from {client_ip} — waiting for batches...")
-            self._respond(200, {"ok": True})
-            return
-
-        if self.path != "/hr":
-            self.send_response(404)
-            self.end_headers()
-            return
-
-        print(f"[{ts}] Receiving batch...")
-
-        length = int(self.headers.get("Content-Length", 0))
-        try:
-            data = json.loads(self.rfile.read(length))
-        except json.JSONDecodeError:
-            self._respond(400, {"error": "bad json"})
-            return
-
-        readings = data.get("readings", [])
-        received = datetime.now().isoformat(timespec="seconds")
-
-        print(f"[{ts}] Batch — {len(readings)} reading(s):")
-        with sqlite3.connect(DB_PATH) as conn:
-            for r in readings:
-                bpm    = r["bpm"]
-                t_ms   = r.get("t_ms", 0)
-                rr     = r.get("rr_ms", [])
-                rr_str = json.dumps([round(x) for x in rr]) if rr else None
-
-                t_sec  = t_ms / 1000.0
-                print(f"  t={t_sec:.1f}s  {bpm} BPM" + (f"  RR: {rr_str} ms" if rr_str else ""))
-
-                conn.execute(
-                    "INSERT INTO readings (received, t_ms, bpm, rr_ms) VALUES (?, ?, ?, ?)",
-                    (received, t_ms, bpm, rr_str),
-                )
-            conn.commit()
-
-        total = sqlite3.connect(DB_PATH).execute("SELECT COUNT(*) FROM readings").fetchone()[0]
-        print(f"  → saved to {DB_PATH.name}  (total rows: {total})")
-
-        self._respond(200, {"ok": True, "count": len(readings)})
-
-    def _respond(self, code, body):
-        payload = json.dumps(body).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
-
-    def log_message(self, *_):
-        pass
+def on_connect(client, userdata, flags, reason_code, properties=None):
+    if reason_code == 0:
+        print(f"Connected to {MQTT_HOST}:{MQTT_PORT} — subscribing to '{MQTT_TOPIC}'")
+        client.subscribe(MQTT_TOPIC)
+    else:
+        print(f"Connection failed: {reason_code}")
 
 
-def get_local_ip():
+def on_message(client, userdata, msg):
+    ts = datetime.now().strftime("%H:%M:%S")
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]
-    except Exception:
-        return "127.0.0.1"
-    finally:
-        s.close()
+        data = json.loads(msg.payload)
+    except json.JSONDecodeError:
+        print(f"[{ts}] Bad JSON on {msg.topic}, skipping")
+        return
+
+    readings = data.get("readings", [])
+    received = datetime.now().isoformat(timespec="seconds")
+
+    print(f"[{ts}] Batch — {len(readings)} reading(s):")
+    with sqlite3.connect(DB_PATH) as conn:
+        for r in readings:
+            bpm    = r["bpm"]
+            t_ms   = r.get("t_ms", 0)
+            rr     = r.get("rr_ms", [])
+            rr_str = json.dumps([round(x) for x in rr]) if rr else None
+
+            t_sec  = t_ms / 1000.0
+            print(f"  t={t_sec:.1f}s  {bpm} BPM" + (f"  RR: {rr_str} ms" if rr_str else ""))
+
+            conn.execute(
+                "INSERT INTO readings (received, t_ms, bpm, rr_ms) VALUES (?, ?, ?, ?)",
+                (received, t_ms, bpm, rr_str),
+            )
+        conn.commit()
+        total = conn.execute("SELECT COUNT(*) FROM readings").fetchone()[0]
+    print(f"  → saved to {DB_PATH.name}  (total rows: {total})")
 
 
-if __name__ == "__main__":
+def main():
     with sqlite3.connect(DB_PATH) as conn:
         init_db(conn)
 
-    local_ip = get_local_ip()
+    if "YOUR-CLUSTER" in MQTT_HOST or "YOUR_MQTT" in MQTT_USER:
+        print("ERROR: set MQTT_HOST / MQTT_USER / MQTT_PASS env vars (see the top of this file).")
+        sys.exit(1)
 
-    # Advertise as hr-server.local via mDNS so ESP32 can find us automatically
-    zc = Zeroconf()
-    info = ServiceInfo(
-        "_http._tcp.local.",
-        "hr-server._http._tcp.local.",
-        addresses=[socket.inet_aton(local_ip)],
-        port=PORT,
-        properties={},
-        server="hr-server.local.",
-    )
-    zc.register_service(info, cooperating_responders=True)
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="rpi-hr-receiver")
+    client.username_pw_set(MQTT_USER, MQTT_PASS)
+    client.tls_set(tls_version=ssl.PROTOCOL_TLS_CLIENT)   # HiveMQ Cloud requires TLS
+    client.on_connect = on_connect
+    client.on_message = on_message
 
-    print(f"HR receiver listening on {local_ip}:{PORT}")
-    print(f"Advertising as hr-server.local (mDNS) — no IP config needed on ESP32")
-    print(f"Saving data to: {DB_PATH}\n")
-    print("Waiting for connection from ESP32...\n")
+    print(f"Saving data to: {DB_PATH}")
+    print(f"Connecting to HiveMQ Cloud at {MQTT_HOST}:{MQTT_PORT}...\n")
+    client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
+    client.loop_forever()   # auto-reconnects on drop
 
-    try:
-        server = HTTPServer(("0.0.0.0", PORT), HRHandler)
-        server.allow_reuse_address = True
-        server.serve_forever()
-    finally:
-        zc.unregister_service(info)
-        zc.close()
+
+if __name__ == "__main__":
+    main()

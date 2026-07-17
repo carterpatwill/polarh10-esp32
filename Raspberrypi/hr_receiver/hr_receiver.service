@@ -6,6 +6,8 @@ After=network.target
 Type=simple
 User=__USER__
 WorkingDirectory=__DIR__
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=__DIR__/mqtt.env
 ExecStart=__DIR__/.venv/bin/python3 __DIR__/hr_receiver.py
 Restart=on-failure
 RestartSec=5

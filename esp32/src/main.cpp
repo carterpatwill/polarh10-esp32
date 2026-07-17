@@ -1,10 +1,10 @@
 #include <Arduino.h>
 #include <WiFi.h>
-#include <ESPmDNS.h>
+#include <WiFiClientSecure.h>
 #include <DNSServer.h>
 #include <esp_eap_client.h>
-#include <HTTPClient.h>
 #include <WebServer.h>
+#include <PubSubClient.h>
 #include <NimBLEDevice.h>
 #include <ArduinoJson.h>
 #include "config.h"
@@ -19,8 +19,9 @@ struct HRReading {
     uint8_t  rr_count;
 };
 
-static String         serverURL;
-static QueueHandle_t  hrQueue;
+static WiFiClientSecure secureClient;
+static PubSubClient      mqtt(secureClient);
+static QueueHandle_t     hrQueue;
 static volatile bool  doConnect = false;
 static NimBLEAddress  polarAddr;
 static NimBLEClient*  pClient   = nullptr;
@@ -81,7 +82,7 @@ static const char INDEX_HTML[] = R"html(<!DOCTYPE html>
   <div id="bpm-unit"></div>
 </div>
 <div class="card">
-  <div class="label">HR Receiver</div>
+  <div class="label">MQTT Broker</div>
   <div class="value" id="recv">—</div>
 </div>
 <script>
@@ -117,9 +118,9 @@ async function tick(){
     const recv=document.getElementById('recv');
     if(d.receiver_ok){
       const sec=Math.round(d.last_post_ms/1000);
-      recv.textContent='Running ✓  (last batch '+sec+'s ago)';recv.className='value on';
+      recv.textContent='Connected to MQTT ✓  (last publish '+sec+'s ago)';recv.className='value on';
     } else {
-      recv.textContent=d.server_url?'Unreachable':'Not found';recv.className='value off';
+      recv.textContent='Not connected to MQTT';recv.className='value off';
     }
   }catch(e){}
 }
@@ -140,7 +141,7 @@ static void handleStatus() {
     doc["bpm_age_ms"]    = connected ? (int32_t)(millis() - lastBPMTime_ms) : -1;
     doc["receiver_ok"]   = receiverOk;
     doc["last_post_ms"]  = receiverOk ? (int32_t)(millis() - lastPostTime_ms) : -1;
-    doc["server_url"]    = serverURL;
+    doc["server_url"]    = MQTT_HOST;
     doc["battery_pct"]   = readBatteryPercent();
     String out;
     serializeJson(doc, out);
@@ -252,8 +253,26 @@ static bool connectToPolar() {
     return true;
 }
 
-// ── Drain queue and POST JSON batch to server ─────────────────────────────────
+// ── (Re)connect to HiveMQ Cloud over TLS ──────────────────────────────────────
+static bool mqttConnect() {
+    if (mqtt.connected()) return true;
+    if (WiFi.status() != WL_CONNECTED) return false;
+
+    Serial.print("[MQTT] Connecting to "); Serial.print(MQTT_HOST); Serial.print("...");
+    if (mqtt.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASS)) {
+        Serial.println(" connected");
+        receiverOk = true;
+        return true;
+    }
+    Serial.printf(" failed, rc=%d\n", mqtt.state());
+    receiverOk = false;
+    return false;
+}
+
+// ── Drain queue and publish JSON batch to HiveMQ ──────────────────────────────
 static void sendBatch() {
+    if (!mqttConnect()) return;
+
     HRReading r;
     JsonDocument doc;
     JsonArray arr = doc["readings"].to<JsonArray>();
@@ -275,19 +294,13 @@ static void sendBatch() {
     String body;
     serializeJson(doc, body);
 
-    HTTPClient http;
-    http.begin(serverURL);
-    http.addHeader("Content-Type", "application/json");
-    int code = http.POST(body);
-    http.end();
-
-    if (code > 0 && code < 300) {
+    if (mqtt.publish(MQTT_TOPIC, body.c_str())) {
         receiverOk      = true;
         lastPostTime_ms = millis();
-        Serial.printf("[WiFi] Sent %d readings → HTTP %d\n", count, code);
+        Serial.printf("[MQTT] Published %d readings (%d bytes) → %s\n", count, body.length(), MQTT_TOPIC);
     } else {
         receiverOk = false;
-        Serial.printf("[WiFi] POST failed: %s\n", http.errorToString(code).c_str());
+        Serial.printf("[MQTT] Publish failed (buffer too small? state=%d)\n", mqtt.state());
     }
 }
 
@@ -358,26 +371,13 @@ void setup() {
     Serial.printf("\n[WiFi] IP: %s\n", WiFi.localIP().toString().c_str());
     flashOnBL();
 
-    MDNS.begin("esp32-polar");
-    Serial.print("[mDNS] Resolving hr-server.local");
-    IPAddress serverIP;
-    for (int i = 0; i < 20; i++) {
-        serverIP = MDNS.queryHost("hr-server");
-        if (serverIP != IPAddress(0,0,0,0)) break;
-        delay(500); Serial.print(".");
-    }
-    if (serverIP == IPAddress(0,0,0,0)) {
-        Serial.println("\n[mDNS] Failed — is hr_receiver.py running?");
-    } else {
-        serverURL = "http://" + serverIP.toString() + ":" + String(SERVER_PORT) + "/hr";
-        Serial.printf("\n[mDNS] Server: %s\n", serverURL.c_str());
-
-        HTTPClient http;
-        http.begin("http://" + serverIP.toString() + ":" + String(SERVER_PORT) + "/hello");
-        int code = http.POST("");
-        http.end();
-        if (code > 0) { receiverOk = true; lastPostTime_ms = millis(); }
-    }
+    // MQTT over TLS to HiveMQ Cloud.
+    // setInsecure() skips server-certificate validation — simplest to get running.
+    // For real cert pinning, replace with secureClient.setCACert(<HiveMQ root CA>).
+    secureClient.setInsecure();
+    mqtt.setServer(MQTT_HOST, MQTT_PORT);
+    mqtt.setBufferSize(4096);   // batches can exceed PubSubClient's 256-byte default
+    mqttConnect();
 
     NimBLEDevice::init("ESP32-Polar");
     auto* scan = NimBLEDevice::getScan();
@@ -396,6 +396,9 @@ static bool     blState    = false;
 void loop() {
     dnsServer.processNextRequest();
     webServer.handleClient();
+
+    if (mqtt.connected()) mqtt.loop();
+    else                  receiverOk = false;
 
     if (doConnect) {
         doConnect = false;
