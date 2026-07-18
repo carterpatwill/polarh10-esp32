@@ -28,6 +28,9 @@ static const uint8_t PMD_START_ACC[] = {
     0x02, 0x01, ACC_RANGE_G, 0x00        // RANGE       = ±ACC_RANGE_G g
 };
 
+// Stop-measurement command: [0x03 stop][0x02 ACC]. Halts the Polar's ACC stream.
+static const uint8_t PMD_STOP_ACC[] = { 0x03, 0x02 };
+
 struct HRReading {
     uint32_t t_ms;
     uint8_t  bpm;
@@ -62,6 +65,22 @@ static volatile int16_t  lastAccY        = 0;
 static volatile int16_t  lastAccZ        = 0;
 static volatile uint32_t lastAccTime_ms  = 0;
 
+// Session state (gate + mark). Idle by default; data is only buffered/published
+// while a session is active. The Pi owns the session identity/timestamps.
+static volatile bool     sessionActive   = false;
+static uint32_t          sessionStart_ms = 0;
+
+// PMD control-point handle, kept live so session start/stop can (re)start or stop
+// the Polar accelerometer stream without reconnecting.
+static NimBLERemoteCharacteristic* pmdCtrlChr = nullptr;
+
+// Latest Pi heartbeat received over MQTT (topic MQTT_TOPIC_PI).
+static volatile bool     piSeen          = false;
+static volatile uint32_t piLastSeen_ms   = 0;
+static bool              piReceiverOk    = false;
+static uint32_t          piHrRows        = 0;
+static char              piLastWrite[32] = "";
+
 static WebServer  webServer(80);
 static DNSServer  dnsServer;
 
@@ -92,11 +111,26 @@ static const char INDEX_HTML[] = R"html(<!DOCTYPE html>
   #bpm-unit{font-size:.9em;color:#8b949e;margin-top:4px}
   .bat-bar{height:8px;background:#30363d;border-radius:4px;margin-top:8px;overflow:hidden}
   .bat-fill{height:100%;border-radius:4px;transition:width .5s}
+  .btn{font:inherit;border:none;border-radius:8px;padding:14px 18px;font-size:1.1em;
+       font-weight:bold;cursor:pointer;flex:1;color:#fff}
+  .btn-start{background:#238636}.btn-stop{background:#da3633}
+  .btn:disabled{opacity:.35;cursor:default}
+  .row{display:flex;gap:10px;margin-top:12px}
+  #sess-timer{font-size:1.6em;font-weight:bold}
 </style>
 </head>
 <body>
 <h1>ESP32 Polar H10</h1>
 <div class="dim" id="addr" style="font-size:.8em;margin-bottom:16px"></div>
+<div class="card">
+  <div class="label">Session</div>
+  <div class="value"><span id="sess-state" class="dim">Idle</span>
+       &nbsp; <span id="sess-timer" class="dim">—</span></div>
+  <div class="row">
+    <button class="btn btn-start" id="btn-start" onclick="session('start')">▶ Start</button>
+    <button class="btn btn-stop"  id="btn-stop"  onclick="session('stop')" disabled>■ Stop</button>
+  </div>
+</div>
 <div class="card">
   <div class="label">Battery</div>
   <div class="value" id="bat">—</div>
@@ -121,10 +155,38 @@ static const char INDEX_HTML[] = R"html(<!DOCTYPE html>
   <div class="label">MQTT Broker</div>
   <div class="value" id="recv">—</div>
 </div>
+<div class="card">
+  <div class="label">Raspberry Pi (receiver)</div>
+  <div class="value" id="pi">—</div>
+</div>
 <script>
+async function session(action){
+  try{ await fetch('/session?action='+action); }catch(e){}
+  tick();
+}
+function fmtDur(ms){
+  const s=Math.max(0,Math.round(ms/1000));
+  const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=s%60;
+  return (h?h+'h ':'')+(m<10?'0':'')+m+'m '+(sec<10?'0':'')+sec+'s';
+}
 async function tick(){
   try{
     const d=await(await fetch('/status')).json();
+
+    // Session
+    const ss=document.getElementById('sess-state');
+    const st=document.getElementById('sess-timer');
+    if(d.session_active){
+      ss.textContent='● Recording';ss.className='on';
+      st.textContent=fmtDur(d.session_ms);st.className='on';
+      document.getElementById('btn-start').disabled=true;
+      document.getElementById('btn-stop').disabled=false;
+    } else {
+      ss.textContent='Idle';ss.className='dim';
+      st.textContent='—';st.className='dim';
+      document.getElementById('btn-start').disabled=false;
+      document.getElementById('btn-stop').disabled=true;
+    }
 
     // Address (mDNS + LAN IP)
     document.getElementById('addr').textContent=
@@ -173,6 +235,20 @@ async function tick(){
     } else {
       recv.textContent='Not connected to MQTT';recv.className='value off';
     }
+
+    // Raspberry Pi heartbeat (relayed via MQTT). Fresh = alive.
+    const pi=document.getElementById('pi');
+    const fresh=d.pi_seen && d.pi_age_ms>=0 && d.pi_age_ms<15000;
+    if(fresh && d.pi_receiver_ok){
+      const sec=Math.round(d.pi_age_ms/1000);
+      pi.textContent='Alive ✓  '+d.pi_hr_rows.toLocaleString()+' rows  (seen '+sec+'s ago)';
+      pi.className='value on';
+    } else if(d.pi_seen){
+      const sec=Math.round(d.pi_age_ms/1000);
+      pi.textContent='No heartbeat — last seen '+sec+'s ago';pi.className='value off';
+    } else {
+      pi.textContent='Waiting for Pi heartbeat…';pi.className='value off';
+    }
   }catch(e){}
 }
 tick();setInterval(tick,1000);
@@ -201,9 +277,66 @@ static void handleStatus() {
     doc["acc_y"]         = (int)lastAccY;
     doc["acc_z"]         = (int)lastAccZ;
     doc["acc_age_ms"]    = accStreaming ? (int32_t)(millis() - lastAccTime_ms) : -1;
+
+    // Session (gate + mark)
+    doc["session_active"] = sessionActive;
+    doc["session_ms"]     = sessionActive ? (int32_t)(millis() - sessionStart_ms) : 0;
+
+    // Pi heartbeat (relayed via MQTT). Age drives the "alive" decision on the page.
+    doc["pi_seen"]        = piSeen;
+    doc["pi_age_ms"]      = piSeen ? (int32_t)(millis() - piLastSeen_ms) : -1;
+    doc["pi_receiver_ok"] = piReceiverOk;
+    doc["pi_hr_rows"]     = piHrRows;
+    doc["pi_last_write"]  = piLastWrite;
+
     String out;
     serializeJson(doc, out);
     webServer.send(200, "application/json", out);
+}
+
+// ── Session control endpoint: /session?action=start|stop ──────────────────────
+static void publishSession(const char* action) {
+    if (!mqtt.connected()) return;
+    JsonDocument d;
+    d["action"] = action;
+    d["t_ms"]   = millis();
+    String s;
+    serializeJson(d, s);
+    mqtt.publish(MQTT_TOPIC_SESSION, s.c_str());
+}
+
+static void handleSession() {
+    String a = webServer.arg("action");
+    if (a == "start") {
+        sessionActive   = true;
+        sessionStart_ms = millis();
+        if (pmdCtrlChr) pmdCtrlChr->writeValue(PMD_START_ACC, sizeof(PMD_START_ACC), true);
+        publishSession("start");
+        Serial.println("[Session] START");
+    } else if (a == "stop") {
+        sessionActive = false;
+        if (pmdCtrlChr) pmdCtrlChr->writeValue(PMD_STOP_ACC, sizeof(PMD_STOP_ACC), true);
+        accStreaming  = false;
+        publishSession("stop");
+        Serial.println("[Session] STOP");
+    } else {
+        webServer.send(400, "application/json", "{\"error\":\"action must be start or stop\"}");
+        return;
+    }
+    webServer.send(200, "application/json", "{\"ok\":true}");
+}
+
+// ── MQTT inbound: receive the Pi's heartbeat ──────────────────────────────────
+static void onMqtt(char* topic, uint8_t* payload, unsigned int len) {
+    JsonDocument doc;
+    if (deserializeJson(doc, payload, len)) return;
+    piSeen        = true;
+    piLastSeen_ms = millis();
+    piReceiverOk  = doc["receiver_ok"] | false;
+    piHrRows      = doc["hr_rows"] | 0;
+    const char* lw = doc["last_write"] | "";
+    strncpy(piLastWrite, lw, sizeof(piLastWrite) - 1);
+    piLastWrite[sizeof(piLastWrite) - 1] = '\0';
 }
 
 // Captive portal: redirect every unknown path to the status page
@@ -242,7 +375,8 @@ static void onHRNotify(NimBLERemoteCharacteristic*, uint8_t* data, size_t len, b
     lastBPM        = r.bpm;
     lastBPMTime_ms = r.t_ms;
 
-    xQueueSend(hrQueue, &r, 0);
+    // Always show the live value; only buffer for upload during an active session.
+    if (sessionActive) xQueueSend(hrQueue, &r, 0);
     Serial.printf("[HR] %d BPM\n", r.bpm);
 }
 
@@ -343,6 +477,7 @@ class ClientCB : public NimBLEClientCallbacks {
         connected    = false;
         accStreaming = false;
         pClient      = nullptr;
+        pmdCtrlChr   = nullptr;
         Serial.printf("[BLE] Disconnected (%d), will rescan\n", reason);
     }
 };
@@ -386,11 +521,17 @@ static bool connectToPolar() {
         if (dataChr && ctrlChr && dataChr->canNotify()) {
             dataChr->subscribe(true, onAccNotify);         // notifications for the sample stream
             ctrlChr->subscribe(false, onPmdControl);       // indications for the command response
-            if (ctrlChr->writeValue(PMD_START_ACC, sizeof(PMD_START_ACC), true)) {
-                Serial.printf("[ACC] Requested ACC stream @ %d Hz, ±%d g\n",
-                              ACC_SAMPLE_RATE, ACC_RANGE_G);
+            pmdCtrlChr = ctrlChr;                          // kept for session start/stop
+            // Only stream while a session is active (covers reconnect mid-session).
+            if (sessionActive) {
+                if (ctrlChr->writeValue(PMD_START_ACC, sizeof(PMD_START_ACC), true)) {
+                    Serial.printf("[ACC] Requested ACC stream @ %d Hz, ±%d g\n",
+                                  ACC_SAMPLE_RATE, ACC_RANGE_G);
+                } else {
+                    Serial.println("[ACC] Failed to write PMD start command");
+                }
             } else {
-                Serial.println("[ACC] Failed to write PMD start command");
+                Serial.println("[ACC] Idle (no session) — ACC stream not started");
             }
         } else {
             Serial.println("[ACC] PMD characteristics not found");
@@ -412,6 +553,7 @@ static bool mqttConnect() {
     if (mqtt.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASS)) {
         Serial.println(" connected");
         receiverOk = true;
+        mqtt.subscribe(MQTT_TOPIC_PI);   // receive the Pi's heartbeat
         return true;
     }
     Serial.printf(" failed, rc=%d\n", mqtt.state());
@@ -515,8 +657,9 @@ void setup() {
     WiFi.mode(WIFI_AP_STA);
     startAP();
 
-    webServer.on("/",       handleRoot);
-    webServer.on("/status", handleStatus);
+    webServer.on("/",        handleRoot);
+    webServer.on("/status",  handleStatus);
+    webServer.on("/session", handleSession);   // start/stop a session (gate + mark)
     webServer.onNotFound(handleCaptive);   // any other path → redirect to portal
     webServer.begin();
     Serial.println("[Web] Status server up on AP");
@@ -571,6 +714,7 @@ void setup() {
     // For real cert pinning, replace with secureClient.setCACert(<HiveMQ root CA>).
     secureClient.setInsecure();
     mqtt.setServer(MQTT_HOST, MQTT_PORT);
+    mqtt.setCallback(onMqtt);   // handle inbound Pi heartbeat
     mqtt.setBufferSize(8192);   // ACC batches are large; well above PubSubClient's 256-byte default
     mqttConnect();
 
