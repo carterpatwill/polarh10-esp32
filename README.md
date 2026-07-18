@@ -41,11 +41,17 @@ Raspberrypi/
     requirements.txt        — paho-mqtt
     hr_receiver.service     — systemd unit (auto-start on boot)
     mqtt.env.example        — template for the Pi's credentials (copy to mqtt.env)
+  dashboard/                — Flask web dashboard the Pi hosts (reads hr_data.db)
+    app.py                  — server + JSON API
+    templates/index.html    — live dashboard page (charts, LIVE/OFFLINE status)
+    install.sh              — one-time setup (venv + Flask + systemd)
+    dashboard.service       — systemd unit (auto-start on boot)
 data/
   hr_data.db                — SQLite database (copied from Pi)
   analyze.py                — analysis script
-deploy-pi.sh                — push Pi code changes from Mac + restart (same network)
-pi-server.sh                — start/stop/status the Pi service from Mac (same network)
+deploy-pi.sh                — push receiver code changes from Mac + restart (same network)
+deploy-dashboard.sh         — push dashboard code changes from Mac + restart (same network)
+pi-server.sh                — start/stop/status the Pi services from Mac (same network)
 ```
 
 ---
@@ -185,6 +191,45 @@ The ESP32 runs an open WiFi access point (`ESP32-Polar`). Connect to it from a p
 ### Verify without the Pi
 
 In the HiveMQ console there's a built-in **Web Client** — log in with your credentials, subscribe to `polar/hr`, and you'll see the heart-rate JSON arrive every ~30s. Confirms the ESP32→cloud half independently of the Pi.
+
+---
+
+## Web Dashboard (view data in a browser)
+
+Instead of copying the DB to your Mac and running scripts, the Pi can host a **live web dashboard** that reads the same `hr_data.db` and shows it in a browser — open it from your phone or laptop on the same network:
+
+```
+http://pi4server.local:8000
+```
+
+It shows:
+- a **LIVE / PAUSED / OFFLINE** banner (so you can tell at a glance if the feed is working) with current BPM and last-reading time,
+- summary cards — total readings, acc samples, session duration, min/avg/max BPM,
+- a **heart-rate chart** and an **accelerometer (X/Y/Z) chart**,
+- time-range buttons (5 min / 30 min / All) and auto-refresh every 3s.
+
+The dashboard is **read-only** — it never writes to or locks the database, so it runs safely alongside `hr_receiver`.
+
+### One-time setup on the Pi
+
+```bash
+./deploy-dashboard.sh                      # from your Mac (same network) — copies the code to the Pi
+ssh carter@pi4server.local
+cd ~/projects/python/esp-polar/dashboard
+./install.sh                               # creates venv, installs Flask, offers to auto-start on boot (say y)
+```
+
+### Control it (same pattern as the receiver)
+
+```bash
+./pi-server.sh status dashboard            # is it running?
+./pi-server.sh restart dashboard
+./deploy-dashboard.sh                      # push code changes + restart
+```
+
+Directly on the Pi: `sudo systemctl status dashboard` · `sudo journalctl -u dashboard -f`.
+
+> The dashboard reads `../hr_receiver/hr_data.db` by default (it's deployed as a sibling folder). Override with the `HR_DB` env var in `dashboard.service` if your layout differs, or change `PORT` (default 8000).
 
 ---
 

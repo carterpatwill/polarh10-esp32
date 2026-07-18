@@ -7,10 +7,14 @@
 #   ./pi-server.sh status     # is it running?
 #   ./pi-server.sh logs        # follow live logs (Ctrl-C to exit)
 #
+# Add a second arg to control the web dashboard instead of the receiver:
+#   ./pi-server.sh status dashboard
+#   ./pi-server.sh restart dashboard
+#
 # NOTE: you must be on the SAME network/WiFi as the Pi for this to work.
 
 PI_HOST="carter@pi4server.local"      # same as deploy-pi.sh
-SERVICE="hr_receiver"
+SERVICE="${2:-hr_receiver}"           # hr_receiver (default) or dashboard
 
 CMD="${1:-status}"
 TTY=""   # only 'logs' needs a real terminal
@@ -21,7 +25,7 @@ case "$CMD" in
     restart) REMOTE="sudo systemctl restart $SERVICE && echo '✓ restarted'";;
     status)  REMOTE="systemctl --no-pager status $SERVICE | head -6"        ;;
     logs)    REMOTE="journalctl -u $SERVICE -f"; TTY="-t"                   ;;
-    *) echo "usage: $0 {start|stop|restart|status|logs}"; exit 2 ;;
+    *) echo "usage: $0 {start|stop|restart|status|logs} [hr_receiver|dashboard]"; exit 2 ;;
 esac
 
 ssh $TTY -o ConnectTimeout=8 "$PI_HOST" "$REMOTE"
