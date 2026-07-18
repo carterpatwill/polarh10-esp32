@@ -9,3 +9,4 @@ compile_commands.json
 src/config.h
 hr_data.db
 mqtt.env
+data/dumps/

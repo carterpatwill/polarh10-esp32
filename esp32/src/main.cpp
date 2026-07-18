@@ -4,6 +4,7 @@
 #include <DNSServer.h>
 #include <esp_eap_client.h>
 #include <WebServer.h>
+#include <ESPmDNS.h>
 #include <PubSubClient.h>
 #include <NimBLEDevice.h>
 #include <ArduinoJson.h>
@@ -12,6 +13,21 @@
 static const char* HR_SVC_UUID  = "0000180D-0000-1000-8000-00805f9b34fb";
 static const char* HR_CHAR_UUID = "00002A37-0000-1000-8000-00805f9b34fb";
 
+// Polar Measurement Data (PMD) service — carries the accelerometer stream
+static const char* PMD_SVC_UUID  = "FB005C80-02E7-F387-1CAD-8ACD2D8DF0C8";
+static const char* PMD_CTRL_UUID = "FB005C81-02E7-F387-1CAD-8ACD2D8DF0C8"; // write + indicate
+static const char* PMD_DATA_UUID = "FB005C82-02E7-F387-1CAD-8ACD2D8DF0C8"; // notify
+
+// Start-measurement command written to the PMD control point.
+// [0x02 start][0x02 ACC] then TLV settings: SAMPLE_RATE, RESOLUTION, RANGE.
+// Sample-rate word (bytes 4-5) is little-endian: 0x19=25, 0x32=50, 0x64=100, 0xC8=200 Hz.
+static const uint8_t PMD_START_ACC[] = {
+    0x02, 0x02,
+    0x00, 0x01, ACC_SAMPLE_RATE, 0x00,   // SAMPLE_RATE = ACC_SAMPLE_RATE Hz
+    0x01, 0x01, 0x10, 0x00,              // RESOLUTION  = 16 bit
+    0x02, 0x01, ACC_RANGE_G, 0x00        // RANGE       = ±ACC_RANGE_G g
+};
+
 struct HRReading {
     uint32_t t_ms;
     uint8_t  bpm;
@@ -19,9 +35,15 @@ struct HRReading {
     uint8_t  rr_count;
 };
 
+struct ACCSample {
+    uint32_t t_ms;   // ESP32 receipt time of the frame this sample arrived in
+    int16_t  x, y, z; // milli-g
+};
+
 static WiFiClientSecure secureClient;
 static PubSubClient      mqtt(secureClient);
 static QueueHandle_t     hrQueue;
+static QueueHandle_t     accQueue;
 static volatile bool  doConnect = false;
 static NimBLEAddress  polarAddr;
 static NimBLEClient*  pClient   = nullptr;
@@ -32,6 +54,13 @@ static volatile uint8_t  lastBPM         = 0;
 static volatile uint32_t lastBPMTime_ms  = 0;
 static bool              receiverOk      = false;
 static uint32_t          lastPostTime_ms = 0;
+
+// Live accelerometer state
+static volatile bool     accStreaming    = false;
+static volatile int16_t  lastAccX        = 0;
+static volatile int16_t  lastAccY        = 0;
+static volatile int16_t  lastAccZ        = 0;
+static volatile uint32_t lastAccTime_ms  = 0;
 
 static WebServer  webServer(80);
 static DNSServer  dnsServer;
@@ -67,6 +96,7 @@ static const char INDEX_HTML[] = R"html(<!DOCTYPE html>
 </head>
 <body>
 <h1>ESP32 Polar H10</h1>
+<div class="dim" id="addr" style="font-size:.8em;margin-bottom:16px"></div>
 <div class="card">
   <div class="label">Battery</div>
   <div class="value" id="bat">—</div>
@@ -81,6 +111,12 @@ static const char INDEX_HTML[] = R"html(<!DOCTYPE html>
   <div id="bpm">—</div>
   <div id="bpm-unit"></div>
 </div>
+<div class="card" id="acc-card" style="display:none">
+  <div class="label">Accelerometer (mg)</div>
+  <div class="value"><span class="dim">X</span> <span id="ax">—</span>
+       &nbsp; <span class="dim">Y</span> <span id="ay">—</span>
+       &nbsp; <span class="dim">Z</span> <span id="az">—</span></div>
+</div>
 <div class="card">
   <div class="label">MQTT Broker</div>
   <div class="value" id="recv">—</div>
@@ -89,6 +125,10 @@ static const char INDEX_HTML[] = R"html(<!DOCTYPE html>
 async function tick(){
   try{
     const d=await(await fetch('/status')).json();
+
+    // Address (mDNS + LAN IP)
+    document.getElementById('addr').textContent=
+      'http://'+d.mdns_host+'/  •  '+d.lan_ip;
 
     // Battery
     const batEl=document.getElementById('bat');
@@ -112,6 +152,17 @@ async function tick(){
     } else {
       ble.textContent='Scanning for Polar…';ble.className='value off';
       hr.style.display='none';
+    }
+
+    // Accelerometer
+    const accCard=document.getElementById('acc-card');
+    if(d.acc_streaming){
+      accCard.style.display='block';
+      document.getElementById('ax').textContent=d.acc_x;
+      document.getElementById('ay').textContent=d.acc_y;
+      document.getElementById('az').textContent=d.acc_z;
+    } else {
+      accCard.style.display='none';
     }
 
     // HR receiver
@@ -142,7 +193,14 @@ static void handleStatus() {
     doc["receiver_ok"]   = receiverOk;
     doc["last_post_ms"]  = receiverOk ? (int32_t)(millis() - lastPostTime_ms) : -1;
     doc["server_url"]    = MQTT_HOST;
+    doc["lan_ip"]        = WiFi.localIP().toString();
+    doc["mdns_host"]     = String(MDNS_HOST) + ".local";
     doc["battery_pct"]   = readBatteryPercent();
+    doc["acc_streaming"] = accStreaming;
+    doc["acc_x"]         = (int)lastAccX;
+    doc["acc_y"]         = (int)lastAccY;
+    doc["acc_z"]         = (int)lastAccZ;
+    doc["acc_age_ms"]    = accStreaming ? (int32_t)(millis() - lastAccTime_ms) : -1;
     String out;
     serializeJson(doc, out);
     webServer.send(200, "application/json", out);
@@ -188,6 +246,74 @@ static void onHRNotify(NimBLERemoteCharacteristic*, uint8_t* data, size_t len, b
     Serial.printf("[HR] %d BPM\n", r.bpm);
 }
 
+// ── PMD helpers: read `bits` bits (LSB-first) at a bit offset, sign-extended ──
+static int32_t readSignedBits(const uint8_t* data, size_t bitPos, uint8_t bits) {
+    int32_t value = 0;
+    for (uint8_t i = 0; i < bits; i++) {
+        size_t  bytePos = (bitPos + i) / 8;
+        uint8_t bit     = (data[bytePos] >> ((bitPos + i) % 8)) & 0x01;
+        value |= (int32_t)bit << i;
+    }
+    if (bits < 32 && (value & (1 << (bits - 1)))) value |= (~0 << bits); // sign extend
+    return value;
+}
+
+static inline void emitAccSample(int32_t x, int32_t y, int32_t z, uint32_t t_ms) {
+    ACCSample s{ t_ms, (int16_t)x, (int16_t)y, (int16_t)z };
+    lastAccX = s.x; lastAccY = s.y; lastAccZ = s.z; lastAccTime_ms = t_ms;
+    xQueueSend(accQueue, &s, 0);
+}
+
+// ── ACC notification callback (PMD data char, delta-compressed frames) ───────
+static void onAccNotify(NimBLERemoteCharacteristic*, uint8_t* data, size_t len, bool) {
+    // [0] measurement type (0x02 = ACC)  [1..8] timestamp (u64 ns)  [9] frame type
+    if (len < 16 || data[0] != 0x02) return;
+    uint32_t t_ms = millis();
+    uint8_t  frameType = data[9];
+
+    if (frameType == 0x01) {
+        // Uncompressed: consecutive int16 (x,y,z) triples in milli-g, 6 bytes each.
+        for (size_t off = 10; off + 6 <= len; off += 6) {
+            int16_t x = (int16_t)(data[off]     | (uint16_t(data[off + 1]) << 8));
+            int16_t y = (int16_t)(data[off + 2] | (uint16_t(data[off + 3]) << 8));
+            int16_t z = (int16_t)(data[off + 4] | (uint16_t(data[off + 5]) << 8));
+            emitAccSample(x, y, z, t_ms);
+        }
+        return;
+    }
+
+    // Fallback: delta/compressed frame (not produced by the H10 at this config).
+    // Reference sample (int16 ×3) followed by byte-aligned [deltaSize][count] groups.
+    int32_t x = (int16_t)(data[10] | (uint16_t(data[11]) << 8));
+    int32_t y = (int16_t)(data[12] | (uint16_t(data[13]) << 8));
+    int32_t z = (int16_t)(data[14] | (uint16_t(data[15]) << 8));
+    emitAccSample(x, y, z, t_ms);
+    size_t offset = 16;
+    while (offset + 2 <= len) {
+        uint8_t deltaSize   = data[offset++];
+        uint8_t sampleCount = data[offset++];
+        if (deltaSize == 0) break;
+        size_t bitPos = offset * 8;
+        for (uint8_t s = 0; s < sampleCount; s++) {
+            x += readSignedBits(data, bitPos, deltaSize); bitPos += deltaSize;
+            y += readSignedBits(data, bitPos, deltaSize); bitPos += deltaSize;
+            z += readSignedBits(data, bitPos, deltaSize); bitPos += deltaSize;
+            emitAccSample(x, y, z, t_ms);
+        }
+        offset += ((size_t)sampleCount * 3 * deltaSize + 7) / 8;
+    }
+}
+
+// ── PMD control-point indication: log the device's response ───────────────────
+static void onPmdControl(NimBLERemoteCharacteristic*, uint8_t* data, size_t len, bool) {
+    if (len >= 4 && data[0] == 0xF0 && data[1] == 0x02) {  // response to a start-measurement cmd
+        uint8_t status = data[3];
+        Serial.printf("[ACC] PMD start response: status=%d %s\n",
+                      status, status == 0 ? "(OK)" : "(error)");
+        accStreaming = (status == 0);
+    }
+}
+
 // ── Backlight / status LED ────────────────────────────────────────────────────
 static constexpr int PIN_BL = 38;
 
@@ -214,8 +340,9 @@ class ScanCB : public NimBLEScanCallbacks {
 // ── BLE client: auto-rescan on disconnect ─────────────────────────────────────
 class ClientCB : public NimBLEClientCallbacks {
     void onDisconnect(NimBLEClient*, int reason) override {
-        connected = false;
-        pClient   = nullptr;
+        connected    = false;
+        accStreaming = false;
+        pClient      = nullptr;
         Serial.printf("[BLE] Disconnected (%d), will rescan\n", reason);
     }
 };
@@ -249,6 +376,29 @@ static bool connectToPolar() {
     chr->subscribe(true, onHRNotify);
     connected = true;
     Serial.println("[BLE] Subscribed to HR notifications");
+
+    // ── Start the PMD accelerometer stream (best-effort; HR still works if absent)
+    accStreaming = false;
+    auto* pmd = pClient->getService(PMD_SVC_UUID);
+    if (pmd) {
+        auto* dataChr = pmd->getCharacteristic(PMD_DATA_UUID);
+        auto* ctrlChr = pmd->getCharacteristic(PMD_CTRL_UUID);
+        if (dataChr && ctrlChr && dataChr->canNotify()) {
+            dataChr->subscribe(true, onAccNotify);         // notifications for the sample stream
+            ctrlChr->subscribe(false, onPmdControl);       // indications for the command response
+            if (ctrlChr->writeValue(PMD_START_ACC, sizeof(PMD_START_ACC), true)) {
+                Serial.printf("[ACC] Requested ACC stream @ %d Hz, ±%d g\n",
+                              ACC_SAMPLE_RATE, ACC_RANGE_G);
+            } else {
+                Serial.println("[ACC] Failed to write PMD start command");
+            }
+        } else {
+            Serial.println("[ACC] PMD characteristics not found");
+        }
+    } else {
+        Serial.println("[ACC] PMD service not found (device may not support ACC)");
+    }
+
     digitalWrite(PIN_BL, LOW);
     return true;
 }
@@ -304,6 +454,40 @@ static void sendBatch() {
     }
 }
 
+// ── Drain ACC queue and publish JSON batch (all 3 axes) to HiveMQ ─────────────
+static void sendAccBatch() {
+    if (uxQueueMessagesWaiting(accQueue) == 0) return;
+    if (!mqttConnect()) return;
+
+    ACCSample s;
+    JsonDocument doc;
+    doc["sample_rate_hz"] = ACC_SAMPLE_RATE;
+    doc["range_g"]        = ACC_RANGE_G;
+    JsonArray arr = doc["samples"].to<JsonArray>();
+    int count = 0;
+
+    while (xQueueReceive(accQueue, &s, 0) == pdTRUE) {
+        JsonArray xyz = arr.add<JsonArray>();   // compact [t_ms, x, y, z]
+        xyz.add(s.t_ms);
+        xyz.add(s.x);
+        xyz.add(s.y);
+        xyz.add(s.z);
+        count++;
+    }
+
+    if (count == 0) return;
+
+    String body;
+    serializeJson(doc, body);
+
+    if (mqtt.publish(MQTT_TOPIC_ACC, body.c_str())) {
+        lastPostTime_ms = millis();
+        Serial.printf("[MQTT] Published %d ACC samples (%d bytes) → %s\n", count, body.length(), MQTT_TOPIC_ACC);
+    } else {
+        Serial.printf("[MQTT] ACC publish failed (buffer too small? state=%d)\n", mqtt.state());
+    }
+}
+
 // ── Start AP + captive portal DNS ────────────────────────────────────────────
 static void startAP() {
     WiFi.softAP(AP_SSID);
@@ -324,7 +508,8 @@ void setup() {
     Serial.begin(115200);
     delay(1000);
 
-    hrQueue = xQueueCreate(QUEUE_LEN, sizeof(HRReading));
+    hrQueue  = xQueueCreate(QUEUE_LEN, sizeof(HRReading));
+    accQueue = xQueueCreate(QUEUE_LEN_ACC, sizeof(ACCSample));
 
     // Start AP + captive portal immediately
     WiFi.mode(WIFI_AP_STA);
@@ -369,6 +554,16 @@ void setup() {
     }
 
     Serial.printf("\n[WiFi] IP: %s\n", WiFi.localIP().toString().c_str());
+
+    // mDNS: reachable at http://<MDNS_HOST>.local/ on the same WiFi
+    if (MDNS.begin(MDNS_HOST)) {
+        MDNS.addService("http", "tcp", 80);
+        Serial.printf("[mDNS] Status page: http://%s.local/  (or http://%s/)\n",
+                      MDNS_HOST, WiFi.localIP().toString().c_str());
+    } else {
+        Serial.println("[mDNS] start failed");
+    }
+
     flashOnBL();
 
     // MQTT over TLS to HiveMQ Cloud.
@@ -376,7 +571,7 @@ void setup() {
     // For real cert pinning, replace with secureClient.setCACert(<HiveMQ root CA>).
     secureClient.setInsecure();
     mqtt.setServer(MQTT_HOST, MQTT_PORT);
-    mqtt.setBufferSize(4096);   // batches can exceed PubSubClient's 256-byte default
+    mqtt.setBufferSize(8192);   // ACC batches are large; well above PubSubClient's 256-byte default
     mqttConnect();
 
     NimBLEDevice::init("ESP32-Polar");
@@ -389,9 +584,10 @@ void setup() {
     Serial.println("[BLE] Scanning for Polar H10...");
 }
 
-static uint32_t lastSend   = 0;
-static uint32_t lastBLTick = 0;
-static bool     blState    = false;
+static uint32_t lastSend    = 0;
+static uint32_t lastAccSend = 0;
+static uint32_t lastBLTick  = 0;
+static bool     blState     = false;
 
 void loop() {
     dnsServer.processNextRequest();
@@ -421,6 +617,11 @@ void loop() {
     if (millis() - lastSend >= BATCH_MS) {
         lastSend = millis();
         if (WiFi.status() == WL_CONNECTED) sendBatch();
+    }
+
+    if (millis() - lastAccSend >= ACC_BATCH_MS) {
+        lastAccSend = millis();
+        if (WiFi.status() == WL_CONNECTED) sendAccBatch();
     }
 
     delay(10);
