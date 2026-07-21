@@ -7,6 +7,10 @@
 #define HOME_SSID      "YOUR_WIFI_SSID"
 #define HOME_PASS      "YOUR_WIFI_PASSWORD"
 
+// ── WiFi — second personal network (tried next) ──────────────────────────────
+#define HOME2_SSID     "YOUR_SECOND_WIFI_SSID"
+#define HOME2_PASS     "YOUR_SECOND_WIFI_PASSWORD"
+
 // ── WiFi — WPA2-Enterprise / eduroam (fallback) ───────────────────────────────
 // Leave as-is if you don't use an enterprise network.
 #define ENT_SSID       "eduroam"
@@ -38,8 +42,24 @@
 // How often the ESP32 publishes its status snapshot to MQTT_TOPIC_ESP (ms).
 #define ESP_STATUS_MS  2000
 
+// ── Board pins — Seeed Studio XIAO ESP32-S3 ──────────────────────────────────
+// Onboard user LED is GPIO21 and is ACTIVE-LOW (driving LOW lights it): it
+// blinks while connecting/scanning and lights solid once a Polar strap connects.
+#define PIN_STATUS_LED  21
+
+// The XIAO has no peripheral power-enable pin (the T-Display-S3 used GPIO15).
+// Leave as -1 to skip. Set to a GPIO if your carrier board needs one driven high.
+#define PIN_POWER_ON    -1
+
 // ── Battery ───────────────────────────────────────────────────────────────────
-#define PIN_BAT_ADC  4    // BAT_VOLT on T-Display-S3; 1:2 voltage divider
+// The XIAO ESP32-S3 does NOT route battery voltage to an ADC by default, so to
+// read battery level you must wire BAT+ through a 1:2 divider (e.g. two equal
+// resistors like 220k/220k) into one of the analog pins, then set PIN_BAT_ADC
+// to that GPIO. Analog-capable pins:
+//   A0=GPIO1  A1=GPIO2  A2=GPIO3  A3=GPIO4  A4=GPIO5  A5=GPIO6
+//   A8=GPIO7  A9=GPIO8  A10=GPIO9
+// Set PIN_BAT_ADC to -1 to disable battery reading (status reports -1 = unknown).
+#define PIN_BAT_ADC  2    // A1 / D1 on XIAO — change to match your divider wiring
 
 // ── Tuning ───────────────────────────────────────────────────────────────────
 #define BATCH_MS   30000   // HR flush interval (ms)

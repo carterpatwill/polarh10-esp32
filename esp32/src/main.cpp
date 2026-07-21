@@ -73,6 +73,7 @@ static NimBLERemoteCharacteristic* pmdCtrlChr = nullptr;
 
 // ── Battery ───────────────────────────────────────────────────────────────────
 static int readBatteryPercent() {
+    if (PIN_BAT_ADC < 0) return -1;                      // no battery divider wired
     uint32_t mv = analogReadMilliVolts(PIN_BAT_ADC) * 2;  // 1:2 divider
     if (mv <= 3000) return 0;
     if (mv >= 4200) return 100;
@@ -254,8 +255,10 @@ static void onPmdControl(NimBLERemoteCharacteristic*, uint8_t* data, size_t len,
     }
 }
 
-// ── Backlight / status LED ────────────────────────────────────────────────────
-static constexpr int PIN_BL = 38;
+// ── Status LED ────────────────────────────────────────────────────────────────
+// On the XIAO ESP32-S3 this is the onboard user LED (GPIO21, active-low): it
+// blinks while connecting/scanning and lights solid once a Polar strap connects.
+static constexpr int PIN_BL = PIN_STATUS_LED;
 
 static void flashOnBL(int times = 3) {
     for (int i = 0; i < times; i++) {
@@ -439,8 +442,11 @@ static void sendAccBatch() {
 
 // ─────────────────────────────────────────────────────────────────────────────
 void setup() {
-    pinMode(15, OUTPUT);
-    digitalWrite(15, HIGH);
+    // Optional peripheral power-enable (unused on the XIAO; PIN_POWER_ON = -1).
+    if (PIN_POWER_ON >= 0) {
+        pinMode(PIN_POWER_ON, OUTPUT);
+        digitalWrite(PIN_POWER_ON, HIGH);
+    }
 
     pinMode(PIN_BL, OUTPUT);
     digitalWrite(PIN_BL, HIGH);
@@ -459,6 +465,21 @@ void setup() {
     Serial.print("[WiFi] Trying personal network");
     WiFi.begin(HOME_SSID, HOME_PASS);
     {
+        bool bl = true;
+        for (int i = 0; i < 20 && WiFi.status() != WL_CONNECTED; i++) {
+            bl = !bl;
+            digitalWrite(PIN_BL, bl ? HIGH : LOW);
+            delay(500); Serial.print(".");
+        }
+    }
+
+    // Try second personal network (10 s)
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.print("\n[WiFi] Trying Gold Coast");
+        WiFi.disconnect(true);
+        delay(500);
+        WiFi.mode(WIFI_STA);
+        WiFi.begin(HOME2_SSID, HOME2_PASS);
         bool bl = true;
         for (int i = 0; i < 20 && WiFi.status() != WL_CONNECTED; i++) {
             bl = !bl;
