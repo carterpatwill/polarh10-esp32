@@ -27,6 +27,11 @@
   .btn-start{background:#238636}.btn-stop{background:#da3633}
   .btn:disabled{opacity:.35;cursor:default}
   .row{display:flex;gap:10px;margin-top:12px}
+  .sess-label-in{width:100%;font:inherit;font-size:1em;background:#0d1117;color:#c9d1d9;
+       border:1px solid #30363d;border-radius:8px;padding:12px 14px;margin-top:12px}
+  .sess-label-in:focus{outline:none;border-color:#58a6ff}
+  .sess-label-in:disabled{opacity:.5}
+  #sess-label-show{text-align:center;font-size:.85em;color:#8b949e;margin-top:4px;min-height:1em;word-break:break-word}
   #sess-timer{font-size:1.6em;font-weight:bold}
   .conn{display:inline-flex;align-items:center;gap:8px;font-size:.85em}
   .dot{width:10px;height:10px;border-radius:50%;background:#f85149}
@@ -97,6 +102,9 @@
   <div class="value" style="text-align:center;margin-top:4px">
        <span id="sess-state" class="dim">—</span>
        &nbsp; <span id="sess-timer" class="dim"></span></div>
+  <div id="sess-label-show"></div>
+  <input id="sess-label" class="sess-label-in" type="text" maxlength="60"
+         placeholder="Label this session (e.g. Football practice)" autocomplete="off">
   <div class="row">
     <button class="btn btn-start" id="btn-start" onclick="session('start')" disabled>▶ Start</button>
     <button class="btn btn-stop"  id="btn-stop"  onclick="session('stop')"  disabled>■ Stop</button>
@@ -188,7 +196,12 @@ client.on("message", (topic, payload) => {
 
 function session(action) {
   if (!brokerConnected) return;
-  client.publish(CFG.topicCmd, JSON.stringify({ action, t_ms: Date.now() }));
+  const msg = { action, t_ms: Date.now() };
+  if (action === "start") {
+    const label = document.getElementById("sess-label").value.trim();
+    if (label) msg.label = label;   // tag the session the Pi is about to open
+  }
+  client.publish(CFG.topicCmd, JSON.stringify(msg));
 }
 
 function fmtDur(ms) {
@@ -324,10 +337,14 @@ function render() {
   const stopBtn  = document.getElementById("btn-stop");
   const ss = document.getElementById("sess-state");
   const st = document.getElementById("sess-timer");
+  const lblIn   = document.getElementById("sess-label");
+  const lblShow = document.getElementById("sess-label-show");
 
   if (!espFresh) {
     ss.textContent = "ESP offline"; ss.className = "dim";
     st.textContent = "";
+    lblShow.textContent = "";
+    lblIn.disabled = false;   // let you pre-type a label while waiting for the ESP
     startBtn.disabled = true; stopBtn.disabled = true;
     return;
   }
@@ -337,10 +354,15 @@ function render() {
     const live = esp.session_ms + (Date.now() - espAt);
     ss.textContent = "● Recording"; ss.className = "on";
     st.textContent = fmtDur(live);  st.className = "on";
+    // Show the label the ESP confirmed for this session; lock the input while live.
+    lblShow.textContent = esp.session_label ? "“" + esp.session_label + "”" : "";
+    lblIn.disabled = true;
     startBtn.disabled = true; stopBtn.disabled = !brokerConnected;
   } else {
     ss.textContent = "Idle"; ss.className = "dim";
     st.textContent = "";
+    lblShow.textContent = "";
+    lblIn.disabled = false;
     startBtn.disabled = !brokerConnected; stopBtn.disabled = true;
   }
 }

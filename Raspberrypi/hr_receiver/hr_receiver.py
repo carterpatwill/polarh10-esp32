@@ -65,7 +65,8 @@ def init_db(conn):
         CREATE TABLE IF NOT EXISTS sessions (
             id       INTEGER PRIMARY KEY AUTOINCREMENT,
             started  TEXT    NOT NULL,
-            ended    TEXT                 -- NULL while the session is still open
+            ended    TEXT,                -- NULL while the session is still open
+            label    TEXT                 -- user-supplied name for the session, or NULL
         )
     """)
     # Tag data rows with the session they belong to. ADD COLUMN is a no-op error
@@ -75,6 +76,11 @@ def init_db(conn):
             conn.execute(f"ALTER TABLE {table} ADD COLUMN session INTEGER")
         except sqlite3.OperationalError:
             pass
+    # Backfill the label column on DBs created before labels existed.
+    try:
+        conn.execute("ALTER TABLE sessions ADD COLUMN label TEXT")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
 
 
@@ -95,10 +101,13 @@ def handle_session(data, received):
     action = data.get("action")
     with sqlite3.connect(DB_PATH) as conn:
         if action == "start":
-            cur = conn.execute("INSERT INTO sessions (started) VALUES (?)", (received,))
+            label = (data.get("label") or "").strip() or None
+            cur = conn.execute("INSERT INTO sessions (started, label) VALUES (?, ?)",
+                               (received, label))
             conn.commit()
             current_session_id = cur.lastrowid
-            print(f"[session] START → id={current_session_id} at {received}")
+            print(f"[session] START → id={current_session_id} at {received}"
+                  + (f"  label={label!r}" if label else ""))
         elif action == "stop":
             if current_session_id is not None:
                 conn.execute("UPDATE sessions SET ended=? WHERE id=?",

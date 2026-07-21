@@ -66,6 +66,7 @@ static volatile uint32_t lastAccTime_ms  = 0;
 // while a session is active. The Pi owns the session identity/timestamps.
 static volatile bool     sessionActive   = false;
 static uint32_t          sessionStart_ms = 0;
+static char              sessionLabel[64] = "";   // user-supplied label for the current session
 
 // PMD control-point handle, kept live so session start/stop can (re)start or stop
 // the Polar accelerometer stream without reconnecting.
@@ -103,6 +104,7 @@ static void publishEspStatus() {
     doc["acc_age_ms"]     = accStreaming ? (int32_t)(millis() - lastAccTime_ms) : -1;
     doc["session_active"] = sessionActive;
     doc["session_ms"]     = sessionActive ? (int32_t)(millis() - sessionStart_ms) : 0;
+    doc["session_label"]  = sessionLabel;   // echo the label back so the page can confirm it
     doc["uptime_ms"]      = (uint32_t)millis();
 
     String out;
@@ -116,25 +118,30 @@ static void publishSession(const char* action) {
     JsonDocument d;
     d["action"] = action;
     d["t_ms"]   = millis();
+    if (strcmp(action, "start") == 0 && sessionLabel[0]) d["label"] = sessionLabel;
     String s;
     serializeJson(d, s);
     mqtt.publish(MQTT_TOPIC_SESSION, s.c_str());
 }
 
 // Apply a start/stop command (received over MQTT_TOPIC_CMD from the control page).
-static void applySession(const char* action) {
+static void applySession(const char* action, const char* label) {
     if (strcmp(action, "start") == 0) {
+        // Capture the label for this session (empty string if none was supplied).
+        strncpy(sessionLabel, label ? label : "", sizeof(sessionLabel) - 1);
+        sessionLabel[sizeof(sessionLabel) - 1] = '\0';
         sessionActive   = true;
         sessionStart_ms = millis();
         if (pmdCtrlChr) pmdCtrlChr->writeValue(PMD_START_ACC, sizeof(PMD_START_ACC), true);
-        publishSession("start");    // tell the Pi receiver to open a session
+        publishSession("start");    // tell the Pi receiver to open a session (with label)
         publishEspStatus();         // reflect the new state to the control page immediately
-        Serial.println("[Session] START (via MQTT)");
+        Serial.printf("[Session] START (via MQTT) label='%s'\n", sessionLabel);
     } else if (strcmp(action, "stop") == 0) {
         sessionActive = false;
         if (pmdCtrlChr) pmdCtrlChr->writeValue(PMD_STOP_ACC, sizeof(PMD_STOP_ACC), true);
         accStreaming  = false;
         publishSession("stop");
+        sessionLabel[0] = '\0';     // clear once the session is closed
         publishEspStatus();
         Serial.println("[Session] STOP (via MQTT)");
     } else {
@@ -148,7 +155,8 @@ static void onMqtt(char* topic, uint8_t* payload, unsigned int len) {
     if (deserializeJson(doc, payload, len)) return;
     if (strcmp(topic, MQTT_TOPIC_CMD) == 0) {
         const char* action = doc["action"] | "";
-        applySession(action);
+        const char* label  = doc["label"]  | "";
+        applySession(action, label);
     }
 }
 
@@ -260,12 +268,39 @@ static void onPmdControl(NimBLERemoteCharacteristic*, uint8_t* data, size_t len,
 // blinks while connecting/scanning and lights solid once a Polar strap connects.
 static constexpr int PIN_BL = PIN_STATUS_LED;
 
+// Status-LED blink rates convey what the board is searching for:
+//   fast blink  → looking for WiFi
+//   slow blink  → WiFi up, scanning for the Polar strap over BLE
+//   solid on    → both connected (see connectToPolar)
+static constexpr uint32_t WIFI_BLINK_MS = 120;   // fast
+static constexpr uint32_t BLE_BLINK_MS  = 700;   // slow
+
 static void flashOnBL(int times = 3) {
     for (int i = 0; i < times; i++) {
         digitalWrite(PIN_BL, LOW);  delay(80);
         digitalWrite(PIN_BL, HIGH); delay(80);
     }
     digitalWrite(PIN_BL, HIGH);
+}
+
+// Block until WiFi connects, blinking the LED at `period_ms`. Gives up after
+// `timeout_ms` (returns false); a timeout_ms of 0 waits forever. Replaces the
+// old fixed 500 ms delay loops so the "searching for WiFi" blink can run fast
+// without shortening how long we actually wait for each network.
+static bool waitForWiFi(uint32_t timeout_ms, uint32_t period_ms) {
+    uint32_t start = millis(), lastToggle = 0;
+    bool bl = false;
+    while (WiFi.status() != WL_CONNECTED) {
+        if (timeout_ms && millis() - start >= timeout_ms) return false;
+        if (millis() - lastToggle >= period_ms) {
+            lastToggle = millis();
+            bl = !bl;
+            digitalWrite(PIN_BL, bl ? HIGH : LOW);
+            Serial.print(".");
+        }
+        delay(10);
+    }
+    return true;
 }
 
 // ── BLE scan: match any Polar device ─────────────────────────────────────────
@@ -461,49 +496,35 @@ void setup() {
     // in a browser and talks to the ESP over MQTT, so the ESP just needs WiFi+BLE.
     WiFi.mode(WIFI_STA);
 
-    // Try personal network first (10 s)
-    Serial.print("[WiFi] Trying personal network");
-    WiFi.begin(HOME_SSID, HOME_PASS);
-    {
-        bool bl = true;
-        for (int i = 0; i < 20 && WiFi.status() != WL_CONNECTED; i++) {
-            bl = !bl;
-            digitalWrite(PIN_BL, bl ? HIGH : LOW);
-            delay(500); Serial.print(".");
-        }
+    // Try eduroam first (10 s) — enterprise WPA2-EAP. Fast blink while searching.
+    Serial.print("[WiFi] Trying eduroam");
+    esp_eap_client_set_identity((uint8_t*)ENT_IDENTITY, strlen(ENT_IDENTITY));
+    esp_eap_client_set_username((uint8_t*)ENT_USER,     strlen(ENT_USER));
+    esp_eap_client_set_password((uint8_t*)ENT_PASS,     strlen(ENT_PASS));
+    esp_wifi_sta_enterprise_enable();
+    WiFi.begin(ENT_SSID);
+    waitForWiFi(10000, WIFI_BLINK_MS);
+
+    // Fall back to the personal network (10 s). Tear down enterprise mode first
+    // so the normal WPA2-PSK join isn't confused by leftover EAP config.
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.print("\n[WiFi] Trying personal network");
+        esp_wifi_sta_enterprise_disable();
+        WiFi.disconnect(true);
+        delay(500);
+        WiFi.mode(WIFI_STA);
+        WiFi.begin(HOME_SSID, HOME_PASS);
+        waitForWiFi(10000, WIFI_BLINK_MS);
     }
 
-    // Try second personal network (10 s)
+    // Last resort: the second personal network — wait indefinitely.
     if (WiFi.status() != WL_CONNECTED) {
         Serial.print("\n[WiFi] Trying Gold Coast");
         WiFi.disconnect(true);
         delay(500);
         WiFi.mode(WIFI_STA);
         WiFi.begin(HOME2_SSID, HOME2_PASS);
-        bool bl = true;
-        for (int i = 0; i < 20 && WiFi.status() != WL_CONNECTED; i++) {
-            bl = !bl;
-            digitalWrite(PIN_BL, bl ? HIGH : LOW);
-            delay(500); Serial.print(".");
-        }
-    }
-
-    if (WiFi.status() != WL_CONNECTED) {
-        Serial.print("\n[WiFi] Trying eduroam");
-        WiFi.disconnect(true);
-        delay(500);
-        WiFi.mode(WIFI_STA);
-        esp_eap_client_set_identity((uint8_t*)ENT_IDENTITY, strlen(ENT_IDENTITY));
-        esp_eap_client_set_username((uint8_t*)ENT_USER,     strlen(ENT_USER));
-        esp_eap_client_set_password((uint8_t*)ENT_PASS,     strlen(ENT_PASS));
-        esp_wifi_sta_enterprise_enable();
-        WiFi.begin(ENT_SSID);
-        bool bl = true;
-        while (WiFi.status() != WL_CONNECTED) {
-            bl = !bl;
-            digitalWrite(PIN_BL, bl ? HIGH : LOW);
-            delay(500); Serial.print(".");
-        }
+        waitForWiFi(0, WIFI_BLINK_MS);   // no network left to fall back to — wait indefinitely
     }
 
     Serial.printf("\n[WiFi] Connected to '%s' (%d dBm), IP: %s\n",
@@ -552,7 +573,7 @@ void loop() {
             Serial.println("[BLE] Restarted scan");
         }
         uint32_t now = millis();
-        if (now - lastBLTick >= 600) {
+        if (now - lastBLTick >= BLE_BLINK_MS) {   // slow blink: WiFi up, scanning for the strap
             lastBLTick = now;
             blState = !blState;
             digitalWrite(PIN_BL, blState ? HIGH : LOW);
