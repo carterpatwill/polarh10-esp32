@@ -485,9 +485,7 @@ void setup() {
         }
     }
 
-    Serial.printf("\n[WiFi] Connected to '%s' (%d dBm), IP: %s\n",
-                  WiFi.SSID().c_str(), (int)WiFi.RSSI(),
-                  WiFi.localIP().toString().c_str());
+    Serial.printf("\n[WiFi] IP: %s\n", WiFi.localIP().toString().c_str());
 
     flashOnBL();
 
