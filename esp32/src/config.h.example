@@ -1,0 +1,52 @@
+#pragma once
+
+// Copy this file to `config.h` and fill in your own values.
+// `config.h` is gitignored so your credentials never get committed.
+
+// ── WiFi — personal network (tried first) ────────────────────────────────────
+#define HOME_SSID      "YOUR_WIFI_SSID"
+#define HOME_PASS      "YOUR_WIFI_PASSWORD"
+
+// ── WiFi — WPA2-Enterprise / eduroam (fallback) ───────────────────────────────
+// Leave as-is if you don't use an enterprise network.
+#define ENT_SSID       "eduroam"
+#define ENT_IDENTITY   "you@school.edu"
+#define ENT_USER       "you@school.edu"
+#define ENT_PASS       "YOUR_ENTERPRISE_PASSWORD"
+
+// ── HiveMQ Cloud (MQTT broker) ───────────────────────────────────────────────
+// Fill these from your HiveMQ Cloud console → "Cluster details" / "Access Management":
+//   MQTT_HOST : the cluster URL, e.g. "abc123def.s1.eu.hivemq.cloud" (no https://)
+//   MQTT_PORT : 8883 for TLS (HiveMQ Cloud requires TLS)
+//   MQTT_USER : the username you created under Access Management → Credentials
+//   MQTT_PASS : that credential's password
+#define MQTT_HOST       "YOUR-CLUSTER.s1.eu.hivemq.cloud"
+#define MQTT_PORT       8883
+#define MQTT_USER       "YOUR_MQTT_USERNAME"
+#define MQTT_PASS       "YOUR_MQTT_PASSWORD"
+#define MQTT_TOPIC      "polar/hr"          // ESP32 publishes HR here, Pi subscribes here
+#define MQTT_TOPIC_ACC  "polar/acc"         // ESP32 publishes accelerometer here
+#define MQTT_TOPIC_PI      "pi/status"      // Pi publishes its heartbeat here, ESP32 subscribes
+#define MQTT_TOPIC_SESSION "polar/session"  // ESP32 publishes session start/stop here, Pi subscribes
+#define MQTT_TOPIC_ESP     "polar/esp_status"  // ESP32 publishes its live status here, control page subscribes
+#define MQTT_TOPIC_CMD     "polar/session_cmd" // control page publishes start/stop here, ESP32 subscribes
+#define MQTT_CLIENT_ID  "esp32-polar"
+
+// Consider a Pi heartbeat "fresh" if seen within this many ms (heartbeat is every 5 s).
+#define PI_FRESH_MS  15000
+
+// How often the ESP32 publishes its status snapshot to MQTT_TOPIC_ESP (ms).
+#define ESP_STATUS_MS  2000
+
+// ── Battery ───────────────────────────────────────────────────────────────────
+#define PIN_BAT_ADC  4    // BAT_VOLT on T-Display-S3; 1:2 voltage divider
+
+// ── Tuning ───────────────────────────────────────────────────────────────────
+#define BATCH_MS   30000   // HR flush interval (ms)
+#define QUEUE_LEN  120     // max HR readings buffered before drop
+
+// ── Accelerometer (Polar PMD service) ────────────────────────────────────────
+#define ACC_SAMPLE_RATE  25      // Hz — must match the PMD start command below (25/50/100/200)
+#define ACC_RANGE_G      8       // ±g full-scale
+#define ACC_BATCH_MS     2000    // ACC flush interval (ms); 25 Hz → ~50 samples/batch
+#define QUEUE_LEN_ACC    256     // max ACC samples buffered before drop
