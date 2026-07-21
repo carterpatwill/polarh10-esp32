@@ -18,7 +18,7 @@ Because both the ESP32 and the Pi connect **out** to HiveMQ Cloud, they no longe
 
 | Part | Details | Link |
 |---|---|---|
-| **ESP32** | LilyGo T-Display-S3 | [Buy](https://lilygo.cc/en-us/products/t-display-s3?srsltid=AfmBOorAvhIBYAfBdJZUqVd6M9FYRvfz8ES51SflbB1JjWLCmOi4rh36) |
+| **ESP32** | Seeed Studio XIAO ESP32-S3 | [Buy](https://www.seeedstudio.com/XIAO-ESP32S3-p-5627.html?srsltid=AfmBOoo0wlJ74bYS3x7DpeEOxG-mdwpJrmbztCb-g2nyqYOBE72SCn6N) |
 | **Heart rate sensor** | Polar H10 | |
 | **Battery** | LiPo battery | [Buy](https://www.amazon.com/dp/B0FZSYM9T2?ref=ppx_yo2ov_dt_b_fed_asin_title&th=1) |
 | **Server** | Raspberry Pi 1GB | |
@@ -26,7 +26,7 @@ Because both the ESP32 and the Pi connect **out** to HiveMQ Cloud, they no longe
 
 <p>
 <img src="images/PolarH10.png" height="200" alt="Polar H10"/>
-<img src="images/EspTdisplay.jpg" height="200" alt="LilyGo T-Display-S3"/>
+<img src="images/xaioEsp-32.png" height="200" alt="Seeed Studio XIAO ESP32-S3"/>
 <img src="images/3.7LipoBattery.jpg" height="200" alt="LiPo battery"/>
 <img src="images/RasberryPi-1G.jpg" height="200" alt="Raspberry Pi 1GB"/>
 </p>
