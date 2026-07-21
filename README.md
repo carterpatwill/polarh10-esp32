@@ -3,9 +3,11 @@
 Real-time heart rate logging from a Polar H10 worn on the field, relayed through an ESP32 to a Raspberry Pi at home **over the internet via HiveMQ Cloud (MQTT)**. Built for football practice — eventual goal is to pair HR data with accelerometer data to get recovery and exertion insights.
 
 ```
-Polar H10 ──BLE──► ESP32 (on body) ──MQTT/TLS──► HiveMQ Cloud ──MQTT──► Raspberry Pi ──► SQLite
-             HR notifications        publish              subscribe        (at home)      hr_data.db
-                                     topic: polar/hr
+                                                          ┌─► Raspberry Pi ──► SQLite (hr_data.db)
+Polar H10 ──BLE──► ESP32 (on body) ──MQTT/TLS──► HiveMQ ──┤   (at home, subscribes)
+             HR + ACC              publish        Cloud   └─► Control page (GitHub Pages)
+             notifications         polar/hr,              subscribe/publish over WebSocket:
+                                   polar/acc              live status + Start/Stop session
 ```
 
 Because both the ESP32 and the Pi connect **out** to HiveMQ Cloud, they no longer need to be on the same WiFi. The ESP32 can be on a phone hotspot at practice while the Pi sits at home — no port forwarding, no same-network requirement.
@@ -22,8 +24,12 @@ Because both the ESP32 and the Pi connect **out** to HiveMQ Cloud, they no longe
 | **Server** | Raspberry Pi 1GB | |
 | **Broker** | HiveMQ Cloud (free tier) | [console](https://console.hivemq.cloud) |
 
-<img src="PolarH10.png" width="300" alt="Polar H10"/>
-<img src="RasberryPi-1G.jpg" width="300" alt="Raspberry Pi 1GB"/>
+<p>
+<img src="images/PolarH10.png" height="200" alt="Polar H10"/>
+<img src="images/EspTdisplay.jpg" height="200" alt="LilyGo T-Display-S3"/>
+<img src="images/3.7LipoBattery.jpg" height="200" alt="LiPo battery"/>
+<img src="images/RasberryPi-1G.jpg" height="200" alt="Raspberry Pi 1GB"/>
+</p>
 
 ---
 
@@ -46,6 +52,9 @@ Raspberrypi/
     templates/index.html    — live dashboard page (charts, LIVE/OFFLINE status)
     install.sh              — one-time setup (venv + Flask + systemd)
     dashboard.service       — systemd unit (auto-start on boot)
+web/
+  control.html              — static control page (served from GitHub Pages; talks to
+                              the broker over MQTT-over-WebSocket, drives start/stop)
 data/
   hr_data.db                — SQLite database (copied from Pi)
   analyze.py                — analysis script
@@ -184,9 +193,18 @@ Power it on. It will:
 | Slow blink | Scanning for Polar H10 |
 | Off | Connected to Polar, recording |
 
-### Captive Portal status page
+### Control Page (GitHub Pages)
 
-The ESP32 runs an open WiFi access point (`ESP32-Polar`). Connect to it from a phone or laptop to see a live status page: battery, BLE connection, current BPM, and an **MQTT Broker** card that shows **"Connected to MQTT ✓"** (or "Not connected to MQTT" if it drops).
+The ESP32 no longer hosts its own web server or WiFi access point — that was too much load alongside BLE + WiFi + MQTT. Instead, a lightweight static page (`web/control.html`, served from **GitHub Pages**) talks straight to the same HiveMQ Cloud broker over MQTT-over-WebSocket. It subscribes to the ESP's status topic and can start/stop a recording session — no same-network requirement, and the ESP just publishes.
+
+<img src="images/control-page.png" width="420" alt="ESP32 Polar control page"/>
+
+What it shows:
+- a **live connection tree** (MQTT ↔ ESP32 / This page / Pi, and Polar H10 ↔ ESP32) where each link turns green and animates when it's carrying data — the dots on the Polar → ESP32 → MQTT legs flow **upward** toward the broker, tracing the HR data path;
+- the **WiFi network** the ESP joined (green WiFi icon + SSID) above the ESP32 node, and a **Bluetooth glyph** by the Polar leaf while the strap is connected;
+- **Start / Stop** session controls, and live **heart-rate** + **accelerometer** charts once a session is running.
+
+The page is published straight from the repo — edit `web/control.html`, push, and GitHub Pages redeploys.
 
 ### Verify without the Pi
 
