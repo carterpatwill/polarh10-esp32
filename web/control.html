@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESP32 Polar — Control</title>
+<!-- MQTT over WebSocket. The ESP32 no longer serves any HTTP; this page talks
+     straight to the HiveMQ Cloud broker over wss and drives the session. -->
+<script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:#0d1117;
+       color:#c9d1d9;padding:20px;max-width:560px;margin:0 auto}
+  h1{color:#58a6ff;margin-bottom:4px;font-size:1.4em}
+  .sub{color:#8b949e;font-size:.8em;margin-bottom:16px;word-break:break-all}
+  .card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;margin-bottom:12px}
+  .label{font-size:.7em;color:#8b949e;text-transform:uppercase;letter-spacing:.1em;margin-bottom:6px}
+  .value{font-size:1.1em}
+  .on{color:#3fb950}.off{color:#f85149}.dim{color:#8b949e}.warn{color:#d29922}
+  #bpm{font-size:3.5em;font-weight:bold;color:#58a6ff;line-height:1}
+  #bpm-unit{font-size:.9em;color:#8b949e;margin-top:4px}
+  .bat-bar{height:8px;background:#30363d;border-radius:4px;margin-top:8px;overflow:hidden}
+  .bat-fill{height:100%;border-radius:4px;transition:width .5s}
+  .btn{font:inherit;border:none;border-radius:8px;padding:14px 18px;font-size:1.1em;
+       font-weight:bold;cursor:pointer;flex:1;color:#fff}
+  .btn-start{background:#238636}.btn-stop{background:#da3633}
+  .btn:disabled{opacity:.35;cursor:default}
+  .row{display:flex;gap:10px;margin-top:12px}
+  #sess-timer{font-size:1.6em;font-weight:bold}
+  .conn{display:inline-flex;align-items:center;gap:8px;font-size:.85em}
+  .dot{width:10px;height:10px;border-radius:50%;background:#f85149}
+  .dot.ok{background:#3fb950}.dot.wait{background:#d29922}
+  /* ── Connection tree (SVG) ── */
+  #graph{width:100%;height:auto;display:block}
+  .link{stroke:#30363d;stroke-width:3;fill:none;stroke-linecap:round}
+  .link.on{stroke:#3fb950;stroke-dasharray:5 6;animation:flow 1s linear infinite}
+  .link.scan{stroke:#d29922;stroke-dasharray:5 6;animation:flow 1.6s linear infinite}
+  @keyframes flow{to{stroke-dashoffset:-11}}
+  .node rect{fill:#161b22;stroke:#30363d;stroke-width:2}
+  .node.on rect{stroke:#3fb950}
+  .node.scan rect{stroke:#d29922}
+  .node.head rect{fill:#1b2230}
+  .node text{fill:#8b949e;font-size:13px;font-weight:bold;
+             text-anchor:middle;dominant-baseline:central}
+  .node.on text{fill:#3fb950}
+  .node.scan text{fill:#d29922}
+  .sublabel{font-size:10px;font-weight:600;fill:#3fb950}
+  .sublabel.amber{fill:#d29922}
+  .chart-box{position:relative;height:150px;margin-top:8px}
+</style>
+</head>
+<body>
+<h1>ESP32 Polar H10</h1>
+
+<div class="card">
+  <svg id="graph" viewBox="0 0 360 270" xmlns="http://www.w3.org/2000/svg">
+    <!-- links first so nodes paint on top of the line ends -->
+    <line id="l-esp"   class="link" x1="180" y1="45" x2="80"  y2="140"/>
+    <line id="l-page"  class="link" x1="180" y1="45" x2="180" y2="140"/>
+    <line id="l-pi"    class="link" x1="180" y1="45" x2="280" y2="140"/>
+    <line id="l-polar" class="link" x1="80"  y1="140" x2="80" y2="225"/>
+    <!-- nodes -->
+    <g id="n-mqtt" class="node head" transform="translate(180,45)">
+      <rect x="-46" y="-19" width="92" height="38" rx="9"/><text>MQTT</text></g>
+    <g id="n-esp" class="node" transform="translate(80,140)">
+      <rect x="-44" y="-18" width="88" height="36" rx="9"/><text>ESP32</text></g>
+    <g id="n-page" class="node" transform="translate(180,140)">
+      <rect x="-46" y="-18" width="92" height="36" rx="9"/><text>This page</text></g>
+    <g id="n-pi" class="node" transform="translate(280,140)">
+      <rect x="-40" y="-18" width="80" height="36" rx="9"/><text>Pi</text>
+      <text id="pi-rows" class="sublabel" y="34"></text></g>
+    <g id="n-polar" class="node" transform="translate(80,225)">
+      <rect x="-48" y="-18" width="96" height="36" rx="9"/><text>Polar H10</text>
+      <text id="polar-sub" class="sublabel amber" y="34"></text></g>
+  </svg>
+  <div class="value" style="text-align:center;margin-top:4px">
+       <span id="sess-state" class="dim">—</span>
+       &nbsp; <span id="sess-timer" class="dim"></span></div>
+  <div class="row">
+    <button class="btn btn-start" id="btn-start" onclick="session('start')" disabled>▶ Start</button>
+    <button class="btn btn-stop"  id="btn-stop"  onclick="session('stop')"  disabled>■ Stop</button>
+  </div>
+</div>
+
+<div class="card" id="hr-card" style="display:none">
+  <div class="label">Heart Rate</div>
+  <div id="bpm">—</div>
+  <div id="bpm-unit"></div>
+  <div class="chart-box"><canvas id="hrChart"></canvas></div>
+</div>
+
+<div class="card" id="acc-card" style="display:none">
+  <div class="label">Accelerometer (mg) — live 25 Hz</div>
+  <div class="chart-box"><canvas id="accChart"></canvas></div>
+</div>
+
+<script>
+// ── Broker config — must match esp32/src/config.h ─────────────────────────────
+// HiveMQ Cloud exposes MQTT-over-WebSocket (TLS) on port 8884, path /mqtt.
+const CFG = {
+  host:  "afa2d2fed1fb40fda695cc3358f8fd78.s1.eu.hivemq.cloud",
+  port:  8884,
+  user:  "Carter",
+  pass:  "NineNine-0923",
+  topicEsp:     "polar/esp_status",   // ESP → us (status snapshots, ~2s)
+  topicCmd:     "polar/session_cmd",  // us → ESP (start/stop)
+  topicPi:      "pi/status",          // Pi receiver heartbeat (retained)
+  topicAcc:     "polar/acc",          // ESP → broker (25Hz ACC batches; we just listen in)
+};
+const ESP_STALE_MS = 6000;   // no status snapshot within this → treat ESP as offline
+const PI_STALE_MS  = 15000;  // Pi heartbeats every 5s → no beat in 15s = not connected
+const HR_CAP  = 120;         // live HR trend window (~4 min at one point / 2s)
+const ACC_CAP = 250;         // live ACC waveform window (~10 s at 25 Hz)
+
+let esp = null, espAt = 0;   // last ESP status payload + when we received it
+let pi  = null, piAt  = 0;
+let brokerConnected = false;
+
+// Rolling buffers for the live charts. Fed straight from MQTT — no extra work
+// for the ESP, which already publishes esp_status and polar/acc regardless.
+const hrBuf = [];                       // recent BPM values
+const accBuf = { x: [], y: [], z: [] }; // recent accelerometer samples (mg)
+let accDirty = false;                   // redraw the ACC chart only when new samples land
+let hrDirty  = false;                   // redraw the HR chart only when a new point lands
+
+function pushCap(arr, v, cap) { arr.push(v); if (arr.length > cap) arr.shift(); }
+
+const url = `wss://${CFG.host}:${CFG.port}/mqtt`;
+const client = mqtt.connect(url, {
+  username: CFG.user,
+  password: CFG.pass,
+  clientId: "web-control-" + Math.random().toString(16).slice(2),
+  clean: true,
+  reconnectPeriod: 3000,
+});
+
+client.on("connect", () => {
+  brokerConnected = true;
+  client.subscribe([CFG.topicEsp, CFG.topicPi, CFG.topicAcc]);
+});
+client.on("reconnect", () => { brokerConnected = false; });
+client.on("close",     () => { brokerConnected = false; });
+client.on("error",     (e) => { console.error("MQTT error", e); });
+
+client.on("message", (topic, payload) => {
+  let data; try { data = JSON.parse(payload.toString()); } catch { return; }
+  if (topic === CFG.topicEsp) {
+    esp = data; espAt = Date.now();
+    // Live HR trend: one point per status snapshot while the strap is connected.
+    if (esp.ble_connected && typeof esp.bpm === "number" && esp.bpm > 0) {
+      pushCap(hrBuf, esp.bpm, HR_CAP); hrDirty = true;
+    }
+  } else if (topic === CFG.topicPi) {
+    pi = data; piAt = Date.now();
+  } else if (topic === CFG.topicAcc) {
+    // Batches look like { samples: [[t_ms, x, y, z], ...] } at ~25 Hz.
+    const s = data.samples || [];
+    for (const p of s) {
+      if (p.length < 4) continue;
+      pushCap(accBuf.x, p[1], ACC_CAP);
+      pushCap(accBuf.y, p[2], ACC_CAP);
+      pushCap(accBuf.z, p[3], ACC_CAP);
+    }
+    if (s.length) accDirty = true;
+  }
+});
+
+function session(action) {
+  if (!brokerConnected) return;
+  client.publish(CFG.topicCmd, JSON.stringify({ action, t_ms: Date.now() }));
+}
+
+function fmtDur(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  return (h ? h + "h " : "") + (m < 10 ? "0" : "") + m + "m " + (sec < 10 ? "0" : "") + sec + "s";
+}
+
+// state: "on" (green) | "scan" (orange) | "off" (grey)
+function setEl(id, state) {
+  if (state === true)  state = "on";
+  if (state === false) state = "off";
+  const el = document.getElementById(id);
+  el.classList.toggle("on",   state === "on");
+  el.classList.toggle("scan", state === "scan");
+}
+
+function updateGraph(espFresh) {
+  // A link is green when that leg is carrying data, orange while it's searching.
+  const piFresh = pi && (Date.now() - piAt) < PI_STALE_MS;
+  const espBroker  = !!espFresh;                              // we receive esp_status → ESP↔broker up
+  const pageBroker = brokerConnected;                         // our own wss link
+  const piBroker   = !!(piFresh && pi && pi.receiver_ok);     // Pi heartbeat fresh + ok
+  // Polar↔ESP: green when connected, orange while the ESP is up but still
+  // scanning (strap not worn yet), grey when the ESP itself is offline.
+  const bleUp   = !!(espFresh && esp && esp.ble_connected);
+  const bleState = bleUp ? "on" : (espFresh ? "scan" : "off");
+
+  setEl("l-esp",   espBroker);
+  setEl("l-page",  pageBroker);
+  setEl("l-pi",    piBroker);
+  setEl("l-polar", bleState);
+
+  setEl("n-mqtt",  brokerConnected);
+  setEl("n-esp",   espBroker);
+  setEl("n-page",  pageBroker);
+  setEl("n-pi",    piBroker);
+  setEl("n-polar", bleState);
+
+  // Row count under the Pi leaf, shown only while it's connected.
+  document.getElementById("pi-rows").textContent =
+    piBroker ? (pi.hr_rows ?? 0).toLocaleString() + " rows" : "";
+
+  // "scanning…" under the Polar leaf while the ESP is searching for the strap.
+  document.getElementById("polar-sub").textContent =
+    bleState === "scan" ? "scanning…" : "";
+}
+
+// ── Live charts (all data comes from MQTT; the ESP does no extra work) ────────
+Chart.defaults.color = "#8b949e";
+Chart.defaults.font.size = 10;
+function mkChart(id, datasets, legend) {
+  return new Chart(document.getElementById(id), {
+    type: "line",
+    data: { labels: [], datasets },
+    options: {
+      animation: false, responsive: true, maintainAspectRatio: false,
+      elements: { point: { radius: 0 }, line: { borderWidth: 1.5, tension: .2 } },
+      scales: { x: { display: false },
+                y: { grid: { color: "rgba(139,148,158,.15)" } } },
+      plugins: { legend: { display: !!legend, labels: { boxWidth: 10 } } },
+    },
+  });
+}
+const hrChart = mkChart("hrChart", [
+  { label: "BPM", data: [], borderColor: "#f85149", fill: true,
+    backgroundColor: "rgba(248,81,73,.08)" },
+]);
+const accChart = mkChart("accChart", [
+  { label: "X", data: [], borderColor: "#58a6ff" },
+  { label: "Y", data: [], borderColor: "#3fb950" },
+  { label: "Z", data: [], borderColor: "#d29922" },
+], true);
+
+function updateLive(espFresh) {
+  const hrCard  = document.getElementById("hr-card");
+  const accCard = document.getElementById("acc-card");
+
+  // Heart rate: number every render, chart only when a new point arrived.
+  if (espFresh && esp.ble_connected) {
+    hrCard.style.display = "block";
+    document.getElementById("bpm").textContent = esp.bpm;
+    const age = Math.round((esp.bpm_age_ms ?? 0) / 1000);
+    document.getElementById("bpm-unit").textContent =
+      age < 5 ? "BPM • live" : "BPM • " + age + "s ago";
+    if (hrDirty) {
+      hrDirty = false;
+      hrChart.data.labels = hrBuf.map((_, i) => i);
+      hrChart.data.datasets[0].data = hrBuf;
+      hrChart.update();
+    }
+  } else {
+    hrCard.style.display = "none";
+  }
+
+  // Accelerometer: 25 Hz waveform from polar/acc, redrawn only on new batches.
+  if (espFresh && (esp.acc_streaming || accBuf.x.length)) {
+    accCard.style.display = "block";
+    if (accDirty) {
+      accDirty = false;
+      accChart.data.labels = accBuf.x.map((_, i) => i);
+      accChart.data.datasets[0].data = accBuf.x;
+      accChart.data.datasets[1].data = accBuf.y;
+      accChart.data.datasets[2].data = accBuf.z;
+      accChart.update();
+    }
+  } else {
+    accCard.style.display = "none";
+  }
+}
+
+function render() {
+  const espFresh = esp && (Date.now() - espAt) < ESP_STALE_MS;
+  updateGraph(espFresh);
+  updateLive(espFresh);
+
+  // Session state + Start/Stop controls (the only non-tree UI left).
+  const startBtn = document.getElementById("btn-start");
+  const stopBtn  = document.getElementById("btn-stop");
+  const ss = document.getElementById("sess-state");
+  const st = document.getElementById("sess-timer");
+
+  if (!espFresh) {
+    ss.textContent = "ESP offline"; ss.className = "dim";
+    st.textContent = "";
+    startBtn.disabled = true; stopBtn.disabled = true;
+    return;
+  }
+
+  if (esp.session_active) {
+    // Interpolate the timer between 2s snapshots for a smooth clock.
+    const live = esp.session_ms + (Date.now() - espAt);
+    ss.textContent = "● Recording"; ss.className = "on";
+    st.textContent = fmtDur(live);  st.className = "on";
+    startBtn.disabled = true; stopBtn.disabled = !brokerConnected;
+  } else {
+    ss.textContent = "Idle"; ss.className = "dim";
+    st.textContent = "";
+    startBtn.disabled = !brokerConnected; stopBtn.disabled = true;
+  }
+}
+
+setInterval(render, 250);
+render();
+</script>
+</body>
+</html>
