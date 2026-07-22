@@ -2,6 +2,8 @@
 
 Real-time heart rate logging from a Polar H10 worn on the field, relayed through an ESP32 to a Raspberry Pi at home **over the internet via HiveMQ Cloud (MQTT)**. Built for football practice — eventual goal is to pair HR data with accelerometer data to get recovery and exertion insights.
 
+<img width="1373" height="702" alt="Polar-esp" src="https://github.com/user-attachments/assets/eb7698d5-0875-499b-a448-3b36b0d97702" />
+
 ```
                                                           ┌─► Raspberry Pi ──► SQLite (hr_data.db)
 Polar H10 ──BLE──► ESP32 (on body) ──MQTT/TLS──► HiveMQ ──┤   (at home, subscribes)
@@ -10,14 +12,13 @@ Polar H10 ──BLE──► ESP32 (on body) ──MQTT/TLS──► HiveMQ ─�
                                    polar/acc              live status + Start/Stop session
 ```
 
-Because both the ESP32 and the Pi connect **out** to HiveMQ Cloud, they no longer need to be on the same WiFi. The ESP32 can be on a phone hotspot at practice while the Pi sits at home — no port forwarding, no same-network requirement.
-
 ---
 ## Polar H10 
 <img src="images/PolarH10.png" height="200" alt="Polar H10"/>
 The Polar H10 is univerally considered the **gold standard** for consumer heart rate sensors
 Streams real-time electrocardiogram (ECG) heart rate data and RR-intervals and 3 axis of acceleration data up to 8gs
 allows insights on
+
 - Heart rate
 - HRV
 - Resperation rate
@@ -42,14 +43,16 @@ accelerometer
 | Part | Details | Link |
 |---|---|---|
 | **ESP32** | Seeed Studio XIAO ESP32-S3 | [Buy](https://www.seeedstudio.com/XIAO-ESP32S3-p-5627.html?srsltid=AfmBOoo0wlJ74bYS3x7DpeEOxG-mdwpJrmbztCb-g2nyqYOBE72SCn6N) |
-| **Heart rate sensor** | Polar H10 | |
+| **Case** | @morozgrafix_12539 | [print](https://www.printables.com/model/1143379-snap-fit-case-for-seeed-studio-xiao-esp32s3) |
+| **Heart rate sensor** | Polar H10 |[Buy](https://www.amazon.com/dp/B07PM565W2?lv=shuf&channelId=500&plpRedirect=mhFallback&th=1) |
 | **Battery** | LiPo battery | [Buy](https://www.amazon.com/dp/B0FZSYM9T2?ref=ppx_yo2ov_dt_b_fed_asin_title&th=1) |
-| **Server** | Raspberry Pi 1GB | |
+| **Server** | Raspberry Pi 1GB | [Buy](https://www.raspberrypi.com/products/raspberry-pi-4-model-b/)|
 | **Broker** | HiveMQ Cloud (free tier) | [console](https://console.hivemq.cloud) |
 
 <p>
 <img src="images/PolarH10.png" height="200" alt="Polar H10"/>
 <img src="images/xaioEsp-32.png" height="200" alt="Seeed Studio XIAO ESP32-S3"/>
+<img width="200" height="200" alt="img_3652" src="https://github.com/user-attachments/assets/150e52e8-e693-4eea-bd5e-bb6775d3d75f" />
 <img src="images/3.7LipoBattery.jpg" height="200" alt="LiPo battery"/>
 <img src="images/RasberryPi-1G.jpg" height="200" alt="Raspberry Pi 1GB"/>
 </p>
