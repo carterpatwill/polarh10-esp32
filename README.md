@@ -13,6 +13,29 @@ Polar H10 ──BLE──► ESP32 (on body) ──MQTT/TLS──► HiveMQ ─�
 Because both the ESP32 and the Pi connect **out** to HiveMQ Cloud, they no longer need to be on the same WiFi. The ESP32 can be on a phone hotspot at practice while the Pi sits at home — no port forwarding, no same-network requirement.
 
 ---
+## Polar H10 
+<img src="images/PolarH10.png" height="200" alt="Polar H10"/>
+The Polar H10 is univerally considered the **gold standard** for consumer heart rate sensors
+Streams real-time electrocardiogram (ECG) heart rate data and RR-intervals and 3 axis of acceleration data up to 8gs
+allows insights on
+- Heart rate
+- HRV
+- Resperation rate
+- VO2max
+- Heart rate recovery
+- Cardiac drift (HR rising over a steady-state effort, indicating fatigue or dehydration)
+  
+- RMSSD (root mean square of successive differences), a common recovery/readiness marker
+- SDNN (standard deviation of NN intervals)
+- pNN50
+- HF/LF power ratio (frequency domain, reflecting sympathetic/parasympathetic balance)
+These feed into readiness scores, overtraining/fatigue detection, and autonomic nervous system status
+
+accelerometer 
+- estimations on actions (walking, sprinting)
+- contacts per practice (fell, got tackled, tackled)
+- 
+
 
 ## Hardware
 
