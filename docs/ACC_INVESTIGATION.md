@@ -1,8 +1,33 @@
 # Accelerometer (PMD) stream fails on the XIAO ESP32-S3
 
-**Status:** Open — root cause not yet found
+**Status:** ✅ RESOLVED — 2026-07-21. Root cause: the BLE link was unencrypted.
 **Date investigated:** 2026-07-21
 **Board:** Seeed XIAO ESP32-S3 (`seeed_xiao_esp32s3`)
+
+## Resolution (the fix)
+
+The Polar H10 **only emits the PMD accelerometer stream over an encrypted BLE link.**
+Heart rate is served in the clear, so it always worked; the ACC control-point
+indications and data notifications were silently withheld on the unencrypted
+connection. CCCD subscribes still returned success and the control point could be
+read/written — the H10 just never *pushed* PMD data without encryption.
+
+The old devkit board had evidently bonded/encrypted with the H10 at some point; the
+fresh XIAO never did, which is why ACC went silent after the board swap. It was never
+RF, the antenna, NimBLE, or the parsing code.
+
+Fix (two lines in `esp32/src/main.cpp`):
+- `NimBLEDevice::setSecurityAuth(true, false, true);` at BLE init (bond, Just-Works /
+  no MITM, LE Secure Connections).
+- `pClient->secureConnection();` right after `connect()`, before subscribing to PMD.
+
+Verified live: after `secureConnection()` the link reports `encrypted=1`, the START
+response indication arrives (`F0 02 02 00 00 01`, status=0 OK), and ACC samples stream
+to MQTT (`polar/acc`).
+
+---
+
+## Original investigation (kept for reference)
 
 ## Summary
 

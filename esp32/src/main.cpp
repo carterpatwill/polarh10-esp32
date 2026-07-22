@@ -344,6 +344,10 @@ static bool connectToPolar() {
         return false;
     }
 
+    // The Polar H10 only emits the PMD accelerometer stream over an encrypted link
+    // (HR works in the clear, ACC does not). Bond/encrypt before touching PMD.
+    pClient->secureConnection();
+
     auto* svc = pClient->getService(HR_SVC_UUID);
     if (!svc) {
         Serial.println("[BLE] HR service not found");
@@ -549,6 +553,9 @@ void setup() {
     mqttConnect();
 
     NimBLEDevice::init("ESP32-Polar");
+    // Polar PMD only streams over an encrypted link. Bond, Just-Works (no MITM),
+    // LE Secure Connections — so the H10 will emit the ACC indications/data.
+    NimBLEDevice::setSecurityAuth(true, false, true);
     auto* scan = NimBLEDevice::getScan();
     scan->setScanCallbacks(new ScanCB(), false);
     scan->setActiveScan(true);
