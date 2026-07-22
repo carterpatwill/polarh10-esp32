@@ -124,6 +124,8 @@ static void publishSession(const char* action) {
     mqtt.publish(MQTT_TOPIC_SESSION, s.c_str());
 }
 
+static void flashOnBL(int times);   // defined below; blinks the status LED quickly
+
 // Apply a start/stop command (received over MQTT_TOPIC_CMD from the control page).
 static void applySession(const char* action, const char* label) {
     if (strcmp(action, "start") == 0) {
@@ -135,6 +137,8 @@ static void applySession(const char* action, const char* label) {
         if (pmdCtrlChr) pmdCtrlChr->writeValue(PMD_START_ACC, sizeof(PMD_START_ACC), true);
         publishSession("start");    // tell the Pi receiver to open a session (with label)
         publishEspStatus();         // reflect the new state to the control page immediately
+        flashOnBL(2);               // two quick flashes = session started
+        digitalWrite(PIN_STATUS_LED, connected ? LOW : HIGH);  // back to steady state
         Serial.printf("[Session] START (via MQTT) label='%s'\n", sessionLabel);
     } else if (strcmp(action, "stop") == 0) {
         sessionActive = false;
@@ -143,6 +147,8 @@ static void applySession(const char* action, const char* label) {
         publishSession("stop");
         sessionLabel[0] = '\0';     // clear once the session is closed
         publishEspStatus();
+        flashOnBL(1);               // one quick flash = session stopped
+        digitalWrite(PIN_STATUS_LED, connected ? LOW : HIGH);  // back to steady state
         Serial.println("[Session] STOP (via MQTT)");
     } else {
         Serial.printf("[Session] Unknown command action: '%s'\n", action);
