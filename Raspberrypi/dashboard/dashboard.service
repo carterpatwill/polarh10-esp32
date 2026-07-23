@@ -8,7 +8,7 @@ User=__USER__
 WorkingDirectory=__DIR__
 Environment=PYTHONUNBUFFERED=1
 Environment=PORT=8000
-# HR_DB defaults to ../hr_receiver/hr_data.db — set it here to override.
+# HR_DB defaults to ../server/hr_data.db — set it here to override.
 ExecStart=__DIR__/.venv/bin/python3 __DIR__/app.py
 Restart=on-failure
 RestartSec=5

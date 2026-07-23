@@ -1,7 +1,7 @@
 # Analyze one recorded session (heart rate + accelerometer).
 #
 # To pull latest data from the Pi:
-#   scp carter@pi4server.local:~/projects/python/esp-polar/hr_receiver/hr_data.db .
+#   scp carter@pi4server.local:~/projects/python/esp-polar/server/hr_data.db .
 #
 # Usage:
 #   python analyze.py              # most recent session
@@ -76,7 +76,7 @@ def main():
     sess, where, params = pick_session(conn, arg)
 
     hr = pd.read_sql(
-        f"SELECT * FROM readings WHERE {where} ORDER BY received", conn, params=params
+        f"SELECT * FROM hr WHERE {where} ORDER BY received", conn, params=params
     )
     acc = pd.read_sql(
         f"SELECT * FROM acc WHERE {where} ORDER BY received", conn, params=params

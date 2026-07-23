@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Polar H10 — Live Dashboard</title>
+<title>Polar H10 — Sessions</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <style>
   :root {
@@ -17,195 +17,213 @@
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     padding: 16px; max-width: 1100px; margin: 0 auto;
   }
-  h1 { font-size: 18px; margin: 0 0 12px; font-weight: 600; }
+  a { color: var(--blue); text-decoration: none; }
+  h1 { font-size: 20px; margin: 0 0 16px; font-weight: 600; }
   h1 .sub { color: var(--muted); font-weight: 400; font-size: 13px; }
-  .banner {
-    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
-    padding: 14px 18px; border-radius: 10px; border: 1px solid var(--line);
-    background: var(--panel); margin-bottom: 16px;
+  .hidden { display: none !important; }
+
+  /* ---- session list ---- */
+  .date-group { margin-bottom: 22px; }
+  .date-head { color: var(--muted); font-size: 12px; text-transform: uppercase;
+               letter-spacing: .6px; margin: 0 0 8px; font-weight: 600; }
+  .session {
+    display: flex; align-items: center; gap: 14px; cursor: pointer;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 14px 16px; margin-bottom: 8px; transition: border-color .12s, background .12s;
   }
-  .dot { width: 12px; height: 12px; border-radius: 50%; flex: none; }
-  .live .dot { background: var(--green); box-shadow: 0 0 0 4px rgba(63,185,80,.2); animation: pulse 1.5s infinite; }
-  .stale .dot { background: var(--amber); }
-  .off .dot { background: var(--red); }
-  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .4; } }
-  .status-label { font-weight: 700; font-size: 15px; letter-spacing: .3px; }
-  .live .status-label { color: var(--green); }
-  .stale .status-label { color: var(--amber); }
-  .off .status-label { color: var(--red); }
-  .banner .bpm { margin-left: auto; font-size: 30px; font-weight: 700; color: var(--red); }
-  .banner .bpm small { font-size: 12px; color: var(--muted); font-weight: 400; }
-  .meta { color: var(--muted); font-size: 13px; }
-  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; margin-bottom: 16px; }
+  .session:hover { border-color: var(--blue); background: #1a2233; }
+  .session .label { font-size: 16px; font-weight: 600; }
+  .session .when { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .session .grow { flex: 1; }
+  .session .metrics { display: flex; gap: 18px; text-align: right; }
+  .session .metric .v { font-size: 15px; font-weight: 700; }
+  .session .metric .k { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .5px; }
+  .session .chev { color: var(--muted); font-size: 20px; }
+  .empty { color: var(--muted); padding: 40px 0; text-align: center; }
+
+  /* ---- detail ---- */
+  .back { display: inline-flex; align-items: center; gap: 6px; margin-bottom: 14px;
+          font-size: 14px; cursor: pointer; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 10px; margin-bottom: 16px; }
   .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
   .card .k { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .5px; }
   .card .v { font-size: 22px; font-weight: 700; margin-top: 4px; }
-  .controls { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
-  button {
-    background: var(--panel); color: var(--text); border: 1px solid var(--line);
-    padding: 6px 14px; border-radius: 7px; cursor: pointer; font-size: 13px;
-  }
-  button.active { background: var(--blue); border-color: var(--blue); color: #08111f; font-weight: 600; }
-  .controls .right { margin-left: auto; color: var(--muted); font-size: 12px; }
   .chart-wrap { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; margin-bottom: 16px; }
   .chart-wrap h2 { font-size: 13px; margin: 0 0 10px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .5px; }
-  /* Fixed-height box stops Chart.js from growing the canvas forever. */
-  .chart-box { position: relative; height: 240px; }
+  .chart-box { position: relative; height: 260px; }
 </style>
 </head>
 <body>
-  <h1>Polar H10 <span class="sub">— live from the Raspberry Pi</span></h1>
 
-  <div id="banner" class="banner off">
-    <span class="dot"></span>
-    <span class="status-label" id="statusLabel">Connecting…</span>
-    <span class="meta" id="statusMeta"></span>
-    <span class="bpm"><span id="curBpm">–</span> <small>BPM</small></span>
-  </div>
+  <!-- ============ LIST VIEW ============ -->
+  <section id="listView">
+    <h1>Sessions <span class="sub">— Polar H10 workouts on the Pi</span></h1>
+    <div id="sessionList"><div class="empty">Loading…</div></div>
+  </section>
 
-  <div class="cards">
-    <div class="card"><div class="k">Readings</div><div class="v" id="cReadings">–</div></div>
-    <div class="card"><div class="k">Acc samples</div><div class="v" id="cAcc">–</div></div>
-    <div class="card"><div class="k">Duration</div><div class="v" id="cDur">–</div></div>
-    <div class="card"><div class="k">Min BPM</div><div class="v" id="cMin">–</div></div>
-    <div class="card"><div class="k">Avg BPM</div><div class="v" id="cAvg">–</div></div>
-    <div class="card"><div class="k">Max BPM</div><div class="v" id="cMax">–</div></div>
-  </div>
-
-  <div class="controls">
-    <span class="meta">Range:</span>
-    <button data-min="5">5 min</button>
-    <button data-min="30" class="active">30 min</button>
-    <button data-min="0">All</button>
-    <span class="right" id="updated"></span>
-  </div>
-
-  <div class="chart-wrap">
-    <h2>Heart rate (BPM)</h2>
-    <div class="chart-box"><canvas id="hrChart"></canvas></div>
-  </div>
-
-  <div class="chart-wrap">
-    <h2>Accelerometer (milli-g)</h2>
-    <div class="chart-box"><canvas id="accChart"></canvas></div>
-  </div>
+  <!-- ============ DETAIL VIEW ============ -->
+  <section id="detailView" class="hidden">
+    <span class="back" onclick="location.hash=''">&larr; All sessions</span>
+    <h1 id="dTitle">Session</h1>
+    <div class="cards">
+      <div class="card"><div class="k">Duration</div><div class="v" id="dDur">–</div></div>
+      <div class="card"><div class="k">Avg BPM</div><div class="v" id="dAvg">–</div></div>
+      <div class="card"><div class="k">Min BPM</div><div class="v" id="dMin">–</div></div>
+      <div class="card"><div class="k">Max BPM</div><div class="v" id="dMax">–</div></div>
+      <div class="card"><div class="k">HR samples</div><div class="v" id="dHr">–</div></div>
+      <div class="card"><div class="k">Acc samples</div><div class="v" id="dAcc">–</div></div>
+    </div>
+    <div class="chart-wrap">
+      <h2>Heart rate (BPM)</h2>
+      <div class="chart-box"><canvas id="hrChart"></canvas></div>
+    </div>
+    <div class="chart-wrap">
+      <h2>Accelerometer (milli-g)</h2>
+      <div class="chart-box"><canvas id="accChart"></canvas></div>
+    </div>
+  </section>
 
 <script>
 const GRID = "rgba(139,148,158,.15)";
 Chart.defaults.color = "#8b949e";
 Chart.defaults.font.size = 11;
 
-function mkChart(id, datasets) {
+// ---------- helpers ----------
+function fmtDur(s) {
+  if (s == null) return "–";
+  const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = s%60;
+  return (h ? h+"h " : "") + (m ? m+"m " : "") + sec + "s";
+}
+function fmtElapsed(sec) {
+  sec = Math.round(sec);
+  const m = Math.floor(sec/60), s = sec%60;
+  return m + ":" + String(s).padStart(2, "0");
+}
+function fmtDate(iso) {
+  return new Date(iso).toLocaleDateString([], { weekday:"short", month:"short", day:"numeric", year:"numeric" });
+}
+function fmtTime(iso) {
+  return new Date(iso).toLocaleTimeString([], { hour:"2-digit", minute:"2-digit" });
+}
+function dayKey(iso) { return iso.slice(0, 10); }  // YYYY-MM-DD
+
+// ---------- list view ----------
+async function loadList() {
+  const box = document.getElementById("sessionList");
+  let sessions;
+  try {
+    sessions = await fetch("/api/sessions").then(r => r.json());
+  } catch (e) {
+    box.innerHTML = `<div class="empty">Couldn't load sessions: ${e.message}</div>`;
+    return;
+  }
+  if (!sessions.length) {
+    box.innerHTML = `<div class="empty">No recorded sessions yet.</div>`;
+    return;
+  }
+  // group by calendar day (already sorted newest-first by the API)
+  const groups = {};
+  for (const s of sessions) (groups[dayKey(s.started)] ??= []).push(s);
+
+  box.innerHTML = Object.entries(groups).map(([day, items]) => `
+    <div class="date-group">
+      <div class="date-head">${fmtDate(day)}</div>
+      ${items.map(s => `
+        <div class="session" onclick="location.hash='#/session/${s.id}'">
+          <div class="grow">
+            <div class="label">${s.label ? escapeHtml(s.label) : "Session #" + s.id}</div>
+            <div class="when">${fmtTime(s.started)} · ${fmtDur(s.duration_s)}</div>
+          </div>
+          <div class="metrics">
+            <div class="metric"><div class="v">${s.hr_count.toLocaleString()}</div><div class="k">HR</div></div>
+            <div class="metric"><div class="v">${s.acc_count.toLocaleString()}</div><div class="k">Acc</div></div>
+          </div>
+          <span class="chev">›</span>
+        </div>`).join("")}
+    </div>`).join("");
+}
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+}
+
+// ---------- detail view ----------
+let hrChart, accChart;
+
+function mkChart(id, datasets, yTitle) {
   return new Chart(document.getElementById(id), {
     type: "line",
     data: { datasets },
     options: {
       animation: false, parsing: false, normalized: true,
       responsive: true, maintainAspectRatio: false,
-      interaction: { mode: "nearest", intersect: false },
+      interaction: { mode: "nearest", axis: "x", intersect: false },
       elements: { point: { radius: 0 }, line: { borderWidth: 1.5, tension: .2 } },
       scales: {
         x: { type: "linear", grid: { color: GRID },
-             ticks: { callback: v => fmtClock(v) } },
-        y: { grid: { color: GRID } }
+             ticks: { callback: v => fmtElapsed(v) },
+             title: { display: true, text: "elapsed (min:sec)" } },
+        y: { grid: { color: GRID }, title: { display: !!yTitle, text: yTitle } }
       },
-      plugins: { legend: { display: datasets.length > 1, labels: { boxWidth: 12 } } }
+      plugins: {
+        legend: { display: datasets.length > 1, labels: { boxWidth: 12 } },
+        tooltip: { callbacks: { title: items => fmtElapsed(items[0].parsed.x) } }
+      }
     }
   });
 }
 
-function fmtClock(msEpoch) {
-  const d = new Date(msEpoch);
-  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+async function loadDetail(sid) {
+  const d = await fetch("/api/session/" + sid).then(r => r.json());
+  if (d.error) { document.getElementById("dTitle").textContent = "Session not found"; return; }
+
+  document.getElementById("dTitle").textContent =
+    (d.label || "Session #" + d.id) + "  ·  " + fmtDate(d.started) + " " + fmtTime(d.started);
+  const st = d.stats || {};
+  document.getElementById("dDur").textContent = fmtDur(d.duration_s);
+  document.getElementById("dAvg").textContent = st.avg ?? "–";
+  document.getElementById("dMin").textContent = st.min ?? "–";
+  document.getElementById("dMax").textContent = st.max ?? "–";
+  document.getElementById("dHr").textContent  = (d.hr_total ?? 0).toLocaleString();
+  document.getElementById("dAcc").textContent = (d.acc_total ?? 0).toLocaleString();
+
+  const hrData = d.hr.map(r => ({ x: r.t, y: r.bpm }));
+  const ax = d.acc.map(r => ({ x: r.t, y: r.x }));
+  const ay = d.acc.map(r => ({ x: r.t, y: r.y }));
+  const az = d.acc.map(r => ({ x: r.t, y: r.z }));
+
+  hrChart?.destroy();
+  accChart?.destroy();
+  hrChart = mkChart("hrChart", [
+    { label: "BPM", data: hrData, borderColor: "#f85149", fill: true,
+      backgroundColor: "rgba(248,81,73,.08)" }
+  ], "BPM");
+  accChart = mkChart("accChart", [
+    { label: "X", data: ax, borderColor: "#58a6ff" },
+    { label: "Y", data: ay, borderColor: "#3fb950" },
+    { label: "Z", data: az, borderColor: "#d29922" },
+  ], "milli-g");
 }
-function fmtDur(s) {
-  if (!s) return "0s";
-  const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = s%60;
-  return (h ? h+"h " : "") + (m ? m+"m " : "") + sec + "s";
-}
 
-const hrChart = mkChart("hrChart", [
-  { label: "BPM", data: [], borderColor: "#f85149", fill: true,
-    backgroundColor: "rgba(248,81,73,.08)" }
-]);
-const accChart = mkChart("accChart", [
-  { label: "X", data: [], borderColor: "#58a6ff" },
-  { label: "Y", data: [], borderColor: "#3fb950" },
-  { label: "Z", data: [], borderColor: "#d29922" },
-]);
-
-let minutes = 30;
-
-// The DB stores wall-clock `received` (ISO local time). Use it as the x-axis so
-// the timeline is meaningful even across multiple ESP32 sessions.
-function toEpoch(iso) { return new Date(iso).getTime(); }
-
-async function refresh() {
-  try {
-    const [st, dt] = await Promise.all([
-      fetch("/api/status").then(r => r.json()),
-      fetch("/api/data" + (minutes ? "?minutes=" + minutes : "")).then(r => r.json()),
-    ]);
-    applyStatus(st);
-    applyData(dt);
-    document.getElementById("updated").textContent =
-      "updated " + new Date().toLocaleTimeString();
-  } catch (e) {
-    setBanner("off", "Dashboard error", e.message);
+// ---------- tiny hash router ----------
+function route() {
+  const m = location.hash.match(/^#\/session\/(\d+)$/);
+  const list = document.getElementById("listView");
+  const detail = document.getElementById("detailView");
+  if (m) {
+    list.classList.add("hidden");
+    detail.classList.remove("hidden");
+    window.scrollTo(0, 0);
+    loadDetail(m[1]);
+  } else {
+    detail.classList.add("hidden");
+    list.classList.remove("hidden");
+    loadList();
   }
 }
 
-function setBanner(cls, label, meta) {
-  const b = document.getElementById("banner");
-  b.className = "banner " + cls;
-  document.getElementById("statusLabel").textContent = label;
-  document.getElementById("statusMeta").textContent = meta || "";
-}
-
-function applyStatus(s) {
-  document.getElementById("curBpm").textContent = s.current_bpm ?? "–";
-  document.getElementById("cReadings").textContent = s.hr_count.toLocaleString();
-  document.getElementById("cAcc").textContent = s.acc_count.toLocaleString();
-
-  if (!s.db_found) return setBanner("off", "No database", "The receiver hasn't created hr_data.db yet.");
-  if (s.last_received == null) return setBanner("off", "No data yet", "Waiting for the first reading…");
-
-  const ago = s.seconds_since_last;
-  const agoTxt = ago < 90 ? Math.round(ago) + "s ago"
-               : ago < 5400 ? Math.round(ago/60) + "m ago"
-               : new Date(s.last_received).toLocaleString();
-  if (s.live)      setBanner("live",  "LIVE",    "last reading " + agoTxt);
-  else if (ago < 300) setBanner("stale", "PAUSED", "no data for " + agoTxt);
-  else             setBanner("off",   "OFFLINE", "last reading " + agoTxt);
-}
-
-function applyData(d) {
-  const st = d.stats || {};
-  document.getElementById("cDur").textContent = st.duration_s != null ? fmtDur(st.duration_s) : "–";
-  document.getElementById("cMin").textContent = st.min ?? "–";
-  document.getElementById("cAvg").textContent = st.avg ?? "–";
-  document.getElementById("cMax").textContent = st.max ?? "–";
-
-  hrChart.data.datasets[0].data = d.hr.map(r => ({ x: toEpoch(r.received), y: r.bpm }));
-  hrChart.update();
-
-  accChart.data.datasets[0].data = d.acc.map(r => ({ x: toEpoch(r.received), y: r.x }));
-  accChart.data.datasets[1].data = d.acc.map(r => ({ x: toEpoch(r.received), y: r.y }));
-  accChart.data.datasets[2].data = d.acc.map(r => ({ x: toEpoch(r.received), y: r.z }));
-  accChart.update();
-}
-
-document.querySelectorAll(".controls button").forEach(btn => {
-  btn.addEventListener("click", () => {
-    document.querySelectorAll(".controls button").forEach(b => b.classList.remove("active"));
-    btn.classList.add("active");
-    minutes = parseInt(btn.dataset.min, 10);
-    refresh();
-  });
-});
-
-refresh();
-setInterval(refresh, 5000);
+window.addEventListener("hashchange", route);
+route();
 </script>
 </body>
 </html>

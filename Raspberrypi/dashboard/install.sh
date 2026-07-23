@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-time setup for the web dashboard on the Pi. Mirrors hr_receiver/install.sh.
+# One-time setup for the web dashboard on the Pi. Mirrors server/install.sh.
 set -e
 
 DIR="$(cd "$(dirname "$0")" && pwd)"

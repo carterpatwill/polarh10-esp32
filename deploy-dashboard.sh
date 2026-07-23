@@ -3,14 +3,14 @@
 #
 #   ./deploy-dashboard.sh
 #
-# Copies Raspberrypi/dashboard/ to the Pi (sibling of hr_receiver so it reads the
+# Copies Raspberrypi/dashboard/ to the Pi (sibling of server so it reads the
 # same hr_data.db), installs Flask, and restarts the dashboard systemd service.
 # You must be on the SAME network as the Pi.
 set -e
 
 # ── EDIT THESE to match your Pi (same as deploy-pi.sh) ───────────────────────
 PI_HOST="carter@pi4server.local"
-PI_DIR="/home/carter/projects/python/esp-polar/dashboard"   # sibling of hr_receiver
+PI_DIR="/home/carter/projects/python/esp-polar/dashboard"   # sibling of server
 # ─────────────────────────────────────────────────────────────────────────────
 
 SRC="$(cd "$(dirname "$0")" && pwd)/Raspberrypi/dashboard/"
