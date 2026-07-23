@@ -31,6 +31,12 @@
        border:1px solid #30363d;border-radius:8px;padding:12px 14px;margin-top:12px}
   .sess-label-in:focus{outline:none;border-color:#58a6ff}
   .sess-label-in:disabled{opacity:.5}
+  .kind-toggle{display:flex;gap:6px;margin-top:8px;font-size:.8em}
+  .kind-toggle label{flex:1;text-align:center;padding:6px;border:1px solid #30363d;border-radius:6px;
+    color:#8b949e;cursor:pointer;user-select:none}
+  .kind-toggle input{display:none}
+  .kind-toggle label:has(input:checked){border-color:#58a6ff;color:#c9d1d9;background:#0d1117}
+  .kind-toggle.disabled{opacity:.5;pointer-events:none}
   #sess-label-show{text-align:center;font-size:.85em;color:#8b949e;margin-top:4px;min-height:1em;word-break:break-word}
   #sess-timer{font-size:1.6em;font-weight:bold}
   .conn{display:inline-flex;align-items:center;gap:8px;font-size:.85em}
@@ -105,6 +111,10 @@
   <div id="sess-label-show"></div>
   <input id="sess-label" class="sess-label-in" type="text" maxlength="60"
          placeholder="Label this session (e.g. Football practice)" autocomplete="off">
+  <div class="kind-toggle" id="kind-toggle">
+    <label><input type="radio" name="kind" value="metric" checked> Metrics</label>
+    <label><input type="radio" name="kind" value="train"> Training</label>
+  </div>
   <div class="row">
     <button class="btn btn-start" id="btn-start" onclick="session('start')" disabled>▶ Start</button>
     <button class="btn btn-stop"  id="btn-stop"  onclick="session('stop')"  disabled>■ Stop</button>
@@ -200,6 +210,8 @@ function session(action) {
   if (action === "start") {
     const label = document.getElementById("sess-label").value.trim();
     if (label) msg.label = label;   // tag the session the Pi is about to open
+    // train = ML example, metric = real workout. The Pi reads this off session_cmd.
+    msg.kind = document.querySelector('input[name="kind"]:checked')?.value || "metric";
   }
   client.publish(CFG.topicCmd, JSON.stringify(msg));
 }
@@ -339,12 +351,14 @@ function render() {
   const st = document.getElementById("sess-timer");
   const lblIn   = document.getElementById("sess-label");
   const lblShow = document.getElementById("sess-label-show");
+  const kindTgl = document.getElementById("kind-toggle");
 
   if (!espFresh) {
     ss.textContent = "ESP offline"; ss.className = "dim";
     st.textContent = "";
     lblShow.textContent = "";
     lblIn.disabled = false;   // let you pre-type a label while waiting for the ESP
+    kindTgl.classList.remove("disabled");
     startBtn.disabled = true; stopBtn.disabled = true;
     return;
   }
@@ -357,12 +371,14 @@ function render() {
     // Show the label the ESP confirmed for this session; lock the input while live.
     lblShow.textContent = esp.session_label ? "“" + esp.session_label + "”" : "";
     lblIn.disabled = true;
+    kindTgl.classList.add("disabled");
     startBtn.disabled = true; stopBtn.disabled = !brokerConnected;
   } else {
     ss.textContent = "Idle"; ss.className = "dim";
     st.textContent = "";
     lblShow.textContent = "";
     lblIn.disabled = false;
+    kindTgl.classList.remove("disabled");
     startBtn.disabled = !brokerConnected; stopBtn.disabled = true;
   }
 }
