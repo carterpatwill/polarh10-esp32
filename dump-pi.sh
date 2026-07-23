@@ -14,7 +14,7 @@ set -euo pipefail
 
 # ── EDIT THESE to match your Pi (same as deploy-pi.sh / pi-server.sh) ─────────
 PI_HOST="carter@pi4server.local"
-REMOTE_DB="/home/carter/projects/python/esp-polar/hr_receiver/hr_data.db"
+REMOTE_DB="/home/carter/projects/python/esp-polar/server/hr_data.db"
 # ─────────────────────────────────────────────────────────────────────────────
 
 ASSUME_YES=0
@@ -52,7 +52,7 @@ with dst:
 def n(c, t):
     try: return c.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
     except Exception: return 0
-print(f"   snapshot rows — readings: {n(src,'readings')}  acc: {n(src,'acc')}")
+print(f"   snapshot rows — hr: {n(src,'hr')}  acc: {n(src,'acc')}")
 src.close(); dst.close()
 PY
 
@@ -79,18 +79,18 @@ if [ "$ASSUME_YES" -ne 1 ]; then
     esac
 fi
 
-echo "→ Clearing readings + acc on the Pi ..."
+echo "→ Clearing hr + acc on the Pi ..."
 ssh "$PI_HOST" "python3 - '$REMOTE_DB'" <<'PY'
 import sqlite3, sys
 c = sqlite3.connect(sys.argv[1])
-before = {t: c.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in ("readings","acc")}
-for t in ("readings","acc"):
+before = {t: c.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in ("hr","acc")}
+for t in ("hr","acc"):
     c.execute(f"DELETE FROM {t}")
 c.execute("DELETE FROM sqlite_sequence")
 c.commit(); c.execute("VACUUM")
-after = {t: c.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in ("readings","acc")}
+after = {t: c.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in ("hr","acc")}
 c.close()
-print(f"   readings: {before['readings']} -> {after['readings']}")
+print(f"   hr: {before['hr']} -> {after['hr']}")
 print(f"   acc:      {before['acc']} -> {after['acc']}")
 PY
 

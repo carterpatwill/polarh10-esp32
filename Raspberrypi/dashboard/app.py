@@ -1,34 +1,36 @@
 #!/usr/bin/env python3
-"""Local web dashboard for the ESP32 Polar H10 data.
+"""Web dashboard for the ESP32 Polar H10 data — session browser.
 
-Serves a live-updating page that reads straight from the SAME hr_data.db the
-receiver writes to (read-only — it never writes or locks it). Open it from any
-device on the same network as the Pi:
+Reads straight from the SAME hr_data.db the receiver writes to (read-only — it
+never writes or locks it). Shows a list of every recorded session; click one to
+see the full heart-rate and accelerometer traces for that workout.
+
+Open it from any device on the same network as the Pi:
 
     http://pi4server.local:8000
 
 Config via environment variables:
-    HR_DB   path to hr_data.db  (default: ../hr_receiver/hr_data.db next to this)
+    HR_DB   path to hr_data.db  (default: ../server/hr_data.db next to this)
     PORT    port to serve on    (default: 8000)
 
 Run manually:
     .venv/bin/python3 app.py
 """
-import json
 import os
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, render_template
 
 # The receiver's DB sits in a sibling folder by default (see deploy-dashboard.sh).
-DEFAULT_DB = Path(__file__).resolve().parent.parent / "hr_receiver" / "hr_data.db"
+DEFAULT_DB = Path(__file__).resolve().parent.parent / "server" / "hr_data.db"
 DB_PATH = Path(os.environ.get("HR_DB", DEFAULT_DB))
 PORT = int(os.environ.get("PORT", "8000"))
 
-# Feed counts as "live" if a reading arrived within this many seconds.
-LIVE_WINDOW_S = 20
+# Cap points sent to the browser so long sessions stay smooth on a phone / 1GB Pi.
+ACC_TARGET = 4000
+HR_TARGET = 3000
 
 app = Flask(__name__)
 
@@ -48,37 +50,17 @@ def q(sql, args=()):
         conn.close()
 
 
-def _cutoff(minutes):
-    return (datetime.now() - timedelta(minutes=minutes)).isoformat(timespec="seconds")
+def one(sql, args=()):
+    rows = q(sql, args)
+    return rows[0] if rows else None
 
 
-def series(table, cols, minutes, target=2500):
-    """Return up to ~`target` rows from `table`, downsampled evenly over the range.
-
-    Downsampling keeps the accelerometer plot light on a 1GB Pi even for long
-    sessions: we take every Nth row so the browser never draws 100k points.
-    """
-    where, args = [], []
-    if minutes:
-        where.append("received >= ?")
-        args.append(_cutoff(minutes))
-    wc = ("WHERE " + " AND ".join(where)) if where else ""
-
-    total = q(f"SELECT COUNT(*) AS n FROM {table} {wc}", args)
-    n = total[0]["n"] if total else 0
-    step = max(1, n // target)
-
-    cond = where + [f"id % {step} = 0"] if step > 1 else where
-    wc2 = ("WHERE " + " AND ".join(cond)) if cond else ""
-    rows = q(f"SELECT {cols} FROM {table} {wc2} ORDER BY id ASC LIMIT {target * 2}", args)
-    return rows, n
-
-
-def _seconds_since(received):
-    if not received:
+def _dur_seconds(started, ended):
+    """Wall-clock seconds between two ISO timestamps, or None if unknown."""
+    if not started or not ended:
         return None
     try:
-        return (datetime.now() - datetime.fromisoformat(received)).total_seconds()
+        return int((datetime.fromisoformat(ended) - datetime.fromisoformat(started)).total_seconds())
     except ValueError:
         return None
 
@@ -88,62 +70,96 @@ def index():
     return render_template("index.html")
 
 
-@app.route("/api/status")
-def status():
-    hr_last = q("SELECT received, bpm FROM readings ORDER BY id DESC LIMIT 1")
-    acc_last = q("SELECT received FROM acc ORDER BY id DESC LIMIT 1")
-    hr_count = q("SELECT COUNT(*) AS n FROM readings")
-    acc_count = q("SELECT COUNT(*) AS n FROM acc")
+@app.route("/api/sessions")
+def sessions():
+    """Every session that actually recorded data, newest first."""
+    rows = q("""
+        SELECT s.id, s.started, s.ended, s.label,
+               (SELECT COUNT(*) FROM hr r WHERE r.session = s.id) AS hr_count,
+               (SELECT COUNT(*) FROM acc a WHERE a.session = s.id)      AS acc_count
+        FROM sessions s
+        ORDER BY s.started DESC
+    """)
+    out = []
+    for r in rows:
+        if not (r["hr_count"] or r["acc_count"]):
+            continue                       # skip empty label-test sessions
+        # Prefer the recorded end time; fall back to the last reading we have.
+        dur = _dur_seconds(r["started"], r["ended"])
+        if dur is None:
+            last = one("SELECT MAX(received) AS m FROM hr WHERE session = ?", (r["id"],))
+            dur = _dur_seconds(r["started"], last["m"] if last else None)
+        out.append({
+            "id": r["id"],
+            "started": r["started"],
+            "ended": r["ended"],
+            "label": r["label"],
+            "hr_count": r["hr_count"],
+            "acc_count": r["acc_count"],
+            "duration_s": dur,
+        })
+    return jsonify(out)
 
-    since = _seconds_since(hr_last[0]["received"] if hr_last else None)
-    return jsonify({
-        "db_found": DB_PATH.exists(),
-        "live": since is not None and since <= LIVE_WINDOW_S,
-        "seconds_since_last": None if since is None else round(since, 1),
-        "last_received": hr_last[0]["received"] if hr_last else None,
-        "current_bpm": hr_last[0]["bpm"] if hr_last else None,
-        "hr_count": hr_count[0]["n"] if hr_count else 0,
-        "acc_count": acc_count[0]["n"] if acc_count else 0,
-    })
+
+def _series(table, cols, sid, t0, target):
+    """Full session rows from `table`, evenly downsampled to ~`target` points.
+
+    x is elapsed seconds from the session's first sample (`t0`) so HR and acc
+    share one timeline even though each table has its own t_ms baseline.
+    """
+    n = one(f"SELECT COUNT(*) AS n FROM {table} WHERE session = ?", (sid,))
+    total = n["n"] if n else 0
+    step = max(1, total // target)
+    cond = f"WHERE session = {int(sid)}"
+    if step > 1:
+        cond += f" AND id % {step} = 0"
+    rows = q(f"SELECT {cols} FROM {table} {cond} ORDER BY id ASC")
+    for r in rows:
+        r["t"] = round((r["t_ms"] - t0) / 1000.0, 2)   # elapsed seconds
+    return rows, total
 
 
-@app.route("/api/data")
-def data():
-    minutes = request.args.get("minutes", type=int)   # None = all time
+@app.route("/api/session/<int:sid>")
+def session_detail(sid):
+    meta = one("SELECT id, started, ended, label FROM sessions WHERE id = ?", (sid,))
+    if meta is None:
+        return jsonify({"error": "no such session"}), 404
 
-    # Keep point counts small so the browser (often a phone) stays smooth and the
-    # 1GB Pi isn't re-drawing tens of thousands of points on every refresh.
-    hr, hr_n = series("readings", "received, t_ms, bpm, rr_ms", minutes, target=1000)
-    acc, acc_n = series("acc", "received, t_ms, x, y, z", minutes, target=700)
+    # Common t0 across both tables so the two charts line up on elapsed time.
+    t0row = one("""
+        SELECT MIN(m) AS t0 FROM (
+            SELECT MIN(t_ms) AS m FROM hr WHERE session = ?
+            UNION ALL
+            SELECT MIN(t_ms) AS m FROM acc WHERE session = ?
+        )
+    """, (sid, sid))
+    t0 = (t0row["t0"] if t0row and t0row["t0"] is not None else 0)
+
+    hr, hr_n = _series("hr", "id, t_ms, bpm", sid, t0, HR_TARGET)
+    acc, acc_n = _series("acc", "id, t_ms, x, y, z", sid, t0, ACC_TARGET)
 
     bpms = [r["bpm"] for r in hr]
     stats = {}
     if bpms:
-        stats = {
-            "min": min(bpms),
-            "max": max(bpms),
-            "avg": round(sum(bpms) / len(bpms), 1),
-            "duration_s": _span_seconds(hr),
-        }
+        stats = {"min": min(bpms), "max": max(bpms), "avg": round(sum(bpms) / len(bpms))}
+
+    dur = _dur_seconds(meta["started"], meta["ended"])
+    if dur is None and (hr or acc):
+        last_t = max([r["t"] for r in hr] + [r["t"] for r in acc])
+        dur = int(last_t)
 
     return jsonify({
-        "hr": hr,
-        "acc": acc,
+        "id": meta["id"],
+        "started": meta["started"],
+        "ended": meta["ended"],
+        "label": meta["label"],
+        "duration_s": dur,
+        "hr": [{"t": r["t"], "bpm": r["bpm"]} for r in hr],
+        "acc": [{"t": r["t"], "x": r["x"], "y": r["y"], "z": r["z"]} for r in acc],
         "hr_total": hr_n,
         "acc_total": acc_n,
         "stats": stats,
     })
-
-
-def _span_seconds(rows):
-    if len(rows) < 2:
-        return 0
-    try:
-        t0 = datetime.fromisoformat(rows[0]["received"])
-        t1 = datetime.fromisoformat(rows[-1]["received"])
-        return int((t1 - t0).total_seconds())
-    except (ValueError, KeyError):
-        return 0
 
 
 if __name__ == "__main__":

@@ -48,6 +48,9 @@ When you start a session on the control page, the **label** carries the truth:
 - For **step counting**, put the number of steps: `walk 30`, `jog 50 steps`.
 - For **activity**, include the activity word: `walk`, `jog`, `run`, `sprint`.
   Any label containing "walk" → the **walk** bucket, and so on.
+- For motion that isn't any of those (sitting, arm waving, fidgeting), use the
+  **`other`** catch-all bucket: label it `sit`, `stand`, `rest`, `idle`, or `other`.
+  This gives the guesser a "none of the gait ones" option.
 - You can do both at once: `Run 40` means bucket=run, true steps=40.
 - **Don't put stray numbers in non-step labels** (`warmup 2` reads as "2 steps").
   For non-activity sessions, keep the label plain (`warmup`, not `lap 3`).
@@ -71,10 +74,11 @@ so **run `calibrate` at least once** before using `activity.py`.
 
 ---
 
-## Tool 2 — `activity.py` (walk / jog / run / sprint)
+## Tool 2 — `activity.py` (walk / jog / run / sprint / other)
 
-Sorts motion into four buckets. All your different walk recordings fold into the
-one `walk` bucket automatically.
+Sorts motion into five buckets. All your different walk recordings fold into the
+one `walk` bucket automatically. `other` is the catch-all for non-gait motion
+(sitting, fidgeting) so the guesser isn't forced to pick a gait when none fits.
 
 ```bash
 python activity.py add        # file the dump's labeled sessions into the library

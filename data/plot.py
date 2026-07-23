@@ -22,7 +22,7 @@ if not os.path.exists(DB):
 
 conn = sqlite3.connect(DB)
 acc = pd.read_sql("SELECT t_ms, x, y, z FROM acc ORDER BY t_ms", conn)
-hr = pd.read_sql("SELECT t_ms, bpm FROM readings ORDER BY t_ms", conn)
+hr = pd.read_sql("SELECT t_ms, bpm FROM hr ORDER BY t_ms", conn)
 conn.close()
 
 # ── Shared timeline: seconds since the earliest sample across both tables ─────

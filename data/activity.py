@@ -3,7 +3,11 @@
 
 Companion to steps.py:
     steps.py     answers "how many steps?"   (a number)
-    activity.py  answers "what activity?"     (a bucket: walk/jog/run/sprint)
+    activity.py  answers "what activity?"     (a bucket: walk/jog/run/sprint/other)
+
+'other' is a catch-all bucket for motion that isn't walking/running — sitting,
+arm waving, fidgeting. Label such a session with a word like "other", "sit",
+"stand", "rest", or "idle" (or force it in with `add <id> --as other`).
 
 ────────────────────────────────────────────────────────────────────────────────
 TWO PLACES DATA LIVES  (this is the whole mental model)
@@ -57,8 +61,21 @@ LIBRARY_DB  = DATA_DIR / "labeled_data" / "labeled_walks.db"  # permanent traini
 STEP_PARAMS = DATA_DIR / "steps_model.json"                 # from `steps.py calibrate`
 CLF_FILE    = DATA_DIR / "labeled_data" / "activity_model.joblib"  # the trained guesser
 
-# ── The four buckets, slowest → fastest ──────────────────────────────────────────
-BUCKETS = ["walk", "jog", "run", "sprint"]
+# ── The buckets ──────────────────────────────────────────────────────────────────
+# walk → sprint are the step-based (gait) buckets, slowest to fastest.
+# 'other' is a catch-all for motion that ISN'T one of those — sitting, arm waving,
+# fidgeting, etc. Having it lets the guesser answer "none of the gait ones" instead
+# of being forced to pick walk/jog/run when nothing really fits.
+BUCKETS = ["walk", "jog", "run", "sprint", "other"]
+
+# A label joins a bucket if it contains any of that bucket's keywords.
+BUCKET_KEYWORDS = {
+    "walk":   ["walk"],
+    "jog":    ["jog"],
+    "run":    ["run"],
+    "sprint": ["sprint"],
+    "other":  ["other", "misc", "idle", "sit", "stand", "still", "rest", "random"],
+}
 
 # ── How motion is described to the guesser ───────────────────────────────────────
 WINDOW_SEC    = 2.0                                          # one analyzed slice
@@ -72,13 +89,14 @@ Session = namedtuple("Session", "id label started acc_rows bucket")
 # PART 1 — labels ↔ buckets
 # ════════════════════════════════════════════════════════════════════════════════
 def bucket_of(label: str | None) -> str | None:
-    """Which bucket a label belongs to, by keyword. 'Slow walk 30' → 'walk'. None if no match."""
+    """Which bucket a label belongs to, by keyword.
+    'Slow walk 30' → 'walk', 'sitting' → 'other'. None if it matches nothing."""
     if not label:
         return None
     low = label.lower()
-    for b in BUCKETS:
-        if b in low:
-            return b
+    for bucket in BUCKETS:
+        if any(kw in low for kw in BUCKET_KEYWORDS[bucket]):
+            return bucket
     return None
 
 
@@ -185,8 +203,8 @@ def cmd_add(args):
             "INSERT INTO acc (received, t_ms, x, y, z, session) "
             "SELECT received, t_ms, x, y, z, ? FROM dump.acc WHERE session = ?", (new_id, sid))
         lib.execute(
-            "INSERT INTO readings (received, t_ms, bpm, rr_ms, session) "
-            "SELECT received, t_ms, bpm, rr_ms, ? FROM dump.readings WHERE session = ?",
+            "INSERT INTO hr (received, t_ms, bpm, rr_ms, session) "
+            "SELECT received, t_ms, bpm, rr_ms, ? FROM dump.hr WHERE session = ?",
             (new_id, sid))
         have.add(started)
         added.append((new_id, store_label, bucket, acc_rows))

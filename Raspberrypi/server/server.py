@@ -43,7 +43,7 @@ last_write_iso     = None            # ISO time of the most recent DB insert
 
 def init_db(conn):
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS readings (
+        CREATE TABLE IF NOT EXISTS hr (
             id        INTEGER PRIMARY KEY AUTOINCREMENT,
             received  TEXT    NOT NULL,
             t_ms      INTEGER NOT NULL,
@@ -71,7 +71,7 @@ def init_db(conn):
     """)
     # Tag data rows with the session they belong to. ADD COLUMN is a no-op error
     # on DBs that already have it, so ignore that specific failure.
-    for table in ("readings", "acc"):
+    for table in ("hr", "acc"):
         try:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN session INTEGER")
         except sqlite3.OperationalError:
@@ -119,7 +119,7 @@ def handle_session(data, received):
 
 def handle_hr(data, received, ts):
     global last_write_iso
-    readings = data.get("readings", [])
+    readings = data.get("readings", [])   # "readings" here is the MQTT payload key, not the table
     print(f"[{ts}] HR batch — {len(readings)} reading(s):")
     with sqlite3.connect(DB_PATH) as conn:
         for r in readings:
@@ -132,13 +132,13 @@ def handle_hr(data, received, ts):
             print(f"  t={t_sec:.1f}s  {bpm} BPM" + (f"  RR: {rr_str} ms" if rr_str else ""))
 
             conn.execute(
-                "INSERT INTO readings (received, t_ms, bpm, rr_ms, session) VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO hr (received, t_ms, bpm, rr_ms, session) VALUES (?, ?, ?, ?, ?)",
                 (received, t_ms, bpm, rr_str, current_session_id),
             )
         conn.commit()
-        total = conn.execute("SELECT COUNT(*) FROM readings").fetchone()[0]
+        total = conn.execute("SELECT COUNT(*) FROM hr").fetchone()[0]
     last_write_iso = received
-    print(f"  → saved to {DB_PATH.name}  (readings rows: {total})")
+    print(f"  → saved to {DB_PATH.name}  (hr rows: {total})")
 
 
 def handle_acc(data, received, ts):
@@ -193,7 +193,7 @@ def heartbeat_loop(client):
         payload = json.dumps({
             "receiver_ok": True,
             "last_write":  last_write_iso,
-            "hr_rows":     _row_count("readings"),
+            "hr_rows":     _row_count("hr"),
             "acc_rows":    _row_count("acc"),
             "session":     current_session_id,
         })
@@ -209,7 +209,7 @@ def main():
         print("ERROR: set MQTT_HOST / MQTT_USER / MQTT_PASS env vars (see the top of this file).")
         sys.exit(1)
 
-    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="rpi-hr-receiver")
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="rpi-server")
     client.username_pw_set(MQTT_USER, MQTT_PASS)
     client.tls_set(tls_version=ssl.PROTOCOL_TLS_CLIENT)   # HiveMQ Cloud requires TLS
     # Last Will: if this process drops, the broker flips the heartbeat to offline

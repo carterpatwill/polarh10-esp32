@@ -5,7 +5,8 @@ Your permanent, growing collection of labeled example walks. Kept here because
 
 ## Files
 - `labeled_walks.db` — the example sessions. Each label's keyword decides its
-  bucket: `walk` / `jog` / `run` / `sprint` (any "walk…" label → walk).
+  bucket: `walk` / `jog` / `run` / `sprint`, plus `other` (a catch-all for
+  non-gait motion — label it `sit`/`stand`/`rest`/`idle`/`other`).
 - `activity_model.joblib` — the trained activity guesser (made by `activity.py train`).
 - `plot_steps.py` — draws each walk with detected steps as red dots.
 - `steps_plot.png` — the latest such plot.

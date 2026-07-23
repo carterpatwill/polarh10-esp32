@@ -67,11 +67,11 @@ esp32/                      — PlatformIO project (flashed to the ESP32)
     main.cpp
     config.h                — WiFi + HiveMQ credentials (gitignored, edit this)
 Raspberrypi/
-  hr_receiver/              — Python MQTT subscriber that runs on the Pi
-    hr_receiver.py
+  server/              — Python MQTT subscriber that runs on the Pi
+    server.py
     install.sh              — one-time setup script
     requirements.txt        — paho-mqtt
-    hr_receiver.service     — systemd unit (auto-start on boot)
+    server.service     — systemd unit (auto-start on boot)
     mqtt.env.example        — template for the Pi's credentials (copy to mqtt.env)
   dashboard/                — Flask web dashboard the Pi hosts (reads hr_data.db)
     app.py                  — server + JSON API
@@ -137,10 +137,10 @@ Then SSH in and run the one-time installer:
 
 ```bash
 ssh carter@pi4server.local
-cd ~/projects/python/esp-polar/hr_receiver
+cd ~/projects/python/esp-polar/server
 ./install.sh          # creates the venv, installs paho-mqtt, sets up mqtt.env + systemd service
 nano mqtt.env         # fill in the SAME 4 HiveMQ values as config.h, then save
-sudo systemctl restart hr_receiver
+sudo systemctl restart server
 ```
 
 > `mqtt.env` holds your credentials and is **gitignored** — it lives only on the Pi and is never overwritten by `deploy-pi.sh`.
@@ -149,7 +149,7 @@ sudo systemctl restart hr_receiver
 
 ## Running & Controlling the Pi Service
 
-The receiver runs as a systemd service (`hr_receiver`) and auto-starts on boot. Three ways to control it depending on where you are:
+The receiver runs as a systemd service (`server`) and auto-starts on boot. Three ways to control it depending on where you are:
 
 ### On your Mac, same network — `pi-server.sh`
 
@@ -181,23 +181,23 @@ This tunnels through your home router, so it works over the internet — no same
 ### Directly on the Pi (raw systemctl)
 
 ```bash
-sudo systemctl start|stop|restart|status hr_receiver
-sudo journalctl -u hr_receiver -f
+sudo systemctl start|stop|restart|status server
+sudo journalctl -u server -f
 ```
 
 ---
 
 ## Deploying Code Changes to the Pi
 
-After editing anything in `Raspberrypi/hr_receiver/`, push it from your Mac (same network):
+After editing anything in `Raspberrypi/server/`, push it from your Mac (same network):
 
 ```bash
 ./deploy-pi.sh
 ```
 
-This rsyncs the folder to `/home/carter/projects/python/esp-polar/hr_receiver`, reinstalls Python deps, and restarts the service. It **never** overwrites the Pi's `.venv`, `hr_data.db`, or `mqtt.env`.
+This rsyncs the folder to `/home/carter/projects/python/esp-polar/server`, reinstalls Python deps, and restarts the service. It **never** overwrites the Pi's `.venv`, `hr_data.db`, or `mqtt.env`.
 
-> If you edit `hr_receiver.service` itself, re-register the systemd unit once on the Pi (re-run `./install.sh` or the `sed | sudo tee` step) — `deploy-pi.sh` copies files and restarts, but doesn't reinstall the unit.
+> If you edit `server.service` itself, re-register the systemd unit once on the Pi (re-run `./install.sh` or the `sed | sudo tee` step) — `deploy-pi.sh` copies files and restarts, but doesn't reinstall the unit.
 
 ---
 
@@ -252,7 +252,7 @@ It shows:
 - a **heart-rate chart** and an **accelerometer (X/Y/Z) chart**,
 - time-range buttons (5 min / 30 min / All) and auto-refresh every 3s.
 
-The dashboard is **read-only** — it never writes to or locks the database, so it runs safely alongside `hr_receiver`.
+The dashboard is **read-only** — it never writes to or locks the database, so it runs safely alongside `server`.
 
 ### One-time setup on the Pi
 
@@ -273,22 +273,25 @@ cd ~/projects/python/esp-polar/dashboard
 
 Directly on the Pi: `sudo systemctl status dashboard` · `sudo journalctl -u dashboard -f`.
 
-> The dashboard reads `../hr_receiver/hr_data.db` by default (it's deployed as a sibling folder). Override with the `HR_DB` env var in `dashboard.service` if your layout differs, or change `PORT` (default 8000).
+> The dashboard reads `../server/hr_data.db` by default (it's deployed as a sibling folder). Override with the `HR_DB` env var in `dashboard.service` if your layout differs, or change `PORT` (default 8000).
 
 ---
 
 ## Data
 
-HR readings are saved to `hr_data.db` (SQLite) on the Pi with:
+HR readings are saved to the `hr` table in `hr_data.db` (SQLite) on the Pi with:
 - `received` — timestamp
 - `t_ms` — millis since ESP32 boot
 - `bpm` — heart rate
 - `rr_ms` — RR intervals (JSON array, ms)
+- `session` — id of the session this reading belongs to (FK → `sessions.id`)
+
+Accelerometer samples go to the `acc` table; each session's metadata (start/end/label) lives in `sessions`.
 
 ### Copy data from the Pi to your Mac
 
 ```bash
-scp carter@pi4server.local:~/projects/python/esp-polar/hr_receiver/hr_data.db data/
+scp carter@pi4server.local:~/projects/python/esp-polar/server/hr_data.db data/
 ```
 
 ### Analyze
