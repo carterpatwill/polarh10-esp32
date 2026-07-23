@@ -11,6 +11,10 @@
 #define HOME2_SSID     "YOUR_SECOND_WIFI_SSID"
 #define HOME2_PASS     "YOUR_SECOND_WIFI_PASSWORD"
 
+// ── WiFi — phone hotspot (tried next) ────────────────────────────────────────
+#define HOME3_SSID     "YOUR_HOTSPOT_SSID"
+#define HOME3_PASS     "YOUR_HOTSPOT_PASSWORD"
+
 // ── WiFi — WPA2-Enterprise / eduroam (fallback) ───────────────────────────────
 // Leave as-is if you don't use an enterprise network.
 #define ENT_SSID       "eduroam"

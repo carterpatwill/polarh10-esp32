@@ -1,0 +1,7 @@
+{
+  "thresh_k": 1.05,
+  "min_dist": 8,
+  "smooth_win": 5,
+  "gravity_win": 25,
+  "sample_rate": 25
+}

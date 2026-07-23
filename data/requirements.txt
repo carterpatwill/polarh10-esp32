@@ -1,0 +1,6 @@
+# Local analysis + activity recognition (data/*.py)
+pandas
+numpy
+matplotlib
+scikit-learn
+joblib
