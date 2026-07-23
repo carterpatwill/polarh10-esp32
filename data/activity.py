@@ -165,8 +165,12 @@ def cmd_add(args):
     have = {r[0] for r in lib.execute("SELECT started FROM sessions").fetchall()}
 
     # Read the dump's sessions (through the attached 'dump' database).
+    # `kind` ('train'/'metric') only exists on dumps from the newer server; older
+    # dumps have no such column, so fall back to NULL (= ungated, old behavior).
+    dump_cols = {r[1] for r in lib.execute("PRAGMA dump.table_info(sessions)").fetchall()}
+    sel_kind = "s.kind" if "kind" in dump_cols else "NULL"
     rows = lib.execute(
-        """SELECT s.id, s.label, s.started,
+        f"""SELECT s.id, s.label, s.started, {sel_kind},
                   (SELECT COUNT(*) FROM dump.acc WHERE session = s.id)
              FROM dump.sessions s ORDER BY s.id"""
     ).fetchall()
@@ -178,13 +182,15 @@ def cmd_add(args):
         raise SystemExit(f"--as must be one of {BUCKETS}")
 
     added, skipped = [], []
-    for sid, label, started, acc_rows in rows:
+    for sid, label, started, kind, acc_rows in rows:
         if args.session is not None and sid != args.session:
             continue
         bucket = forced or bucket_of(label)
         reason = None
         if acc_rows == 0:
             reason = "no accelerometer data"
+        elif kind == "metric" and not forced:
+            reason = "kind=metric (real workout, not training) — use --as to force"
         elif bucket is None:
             reason = "label has no walk/jog/run/sprint keyword (use --as)"
         elif started in have:

@@ -30,7 +30,8 @@ MQTT_PASS      = os.environ.get("MQTT_PASS",  "YOUR_MQTT_PASSWORD")
 MQTT_TOPIC     = os.environ.get("MQTT_TOPIC",     "polar/hr")
 MQTT_TOPIC_ACC = os.environ.get("MQTT_TOPIC_ACC", "polar/acc")
 MQTT_TOPIC_PI      = os.environ.get("MQTT_TOPIC_PI",      "pi/status")     # heartbeat we publish
-MQTT_TOPIC_SESSION = os.environ.get("MQTT_TOPIC_SESSION", "polar/session") # start/stop we receive
+MQTT_TOPIC_SESSION = os.environ.get("MQTT_TOPIC_SESSION", "polar/session") # start/stop we receive (from ESP, carries label)
+MQTT_TOPIC_CMD     = os.environ.get("MQTT_TOPIC_CMD",     "polar/session_cmd") # control page → ESP; we also read it for `kind`
 
 HEARTBEAT_S = 5   # publish pi/status this often
 
@@ -39,6 +40,8 @@ DB_PATH = Path(__file__).parent / "hr_data.db"
 # Live state shared with the heartbeat thread.
 current_session_id = None            # id of the open session, or None when idle
 last_write_iso     = None            # ISO time of the most recent DB insert
+pending_kind       = "metric"        # kind ('train'/'metric') for the next session to open;
+                                     # set from the control page's session_cmd (path A, no ESP reflash)
 
 
 def init_db(conn):
@@ -66,7 +69,8 @@ def init_db(conn):
             id       INTEGER PRIMARY KEY AUTOINCREMENT,
             started  TEXT    NOT NULL,
             ended    TEXT,                -- NULL while the session is still open
-            label    TEXT                 -- user-supplied name for the session, or NULL
+            label    TEXT,                -- user-supplied name for the session, or NULL
+            kind     TEXT DEFAULT 'metric' -- 'train' (ML example) or 'metric' (real workout)
         )
     """)
     # Tag data rows with the session they belong to. ADD COLUMN is a no-op error
@@ -76,23 +80,36 @@ def init_db(conn):
             conn.execute(f"ALTER TABLE {table} ADD COLUMN session INTEGER")
         except sqlite3.OperationalError:
             pass
-    # Backfill the label column on DBs created before labels existed.
-    try:
-        conn.execute("ALTER TABLE sessions ADD COLUMN label TEXT")
-    except sqlite3.OperationalError:
-        pass
+    # Backfill columns on DBs created before they existed (each a no-op if present).
+    for ddl in ("ALTER TABLE sessions ADD COLUMN label TEXT",
+                "ALTER TABLE sessions ADD COLUMN kind TEXT DEFAULT 'metric'"):
+        try:
+            conn.execute(ddl)
+        except sqlite3.OperationalError:
+            pass
     conn.commit()
 
 
 def on_connect(client, userdata, flags, reason_code, properties=None):
     if reason_code == 0:
         print(f"Connected to {MQTT_HOST}:{MQTT_PORT} — subscribing to "
-              f"'{MQTT_TOPIC}', '{MQTT_TOPIC_ACC}', '{MQTT_TOPIC_SESSION}'")
+              f"'{MQTT_TOPIC}', '{MQTT_TOPIC_ACC}', '{MQTT_TOPIC_SESSION}', '{MQTT_TOPIC_CMD}'")
         client.subscribe(MQTT_TOPIC)
         client.subscribe(MQTT_TOPIC_ACC)
         client.subscribe(MQTT_TOPIC_SESSION)
+        client.subscribe(MQTT_TOPIC_CMD)
     else:
         print(f"Connection failed: {reason_code}")
+
+
+def handle_cmd(data):
+    """The control page's start/stop command. We don't act on it (the ESP does that
+    and relays the real mark on polar/session) — we only capture `kind` so the
+    session the ESP is about to open gets tagged train vs metric. No firmware needed."""
+    global pending_kind
+    if data.get("action") == "start":
+        kind = data.get("kind")
+        pending_kind = kind if kind in ("train", "metric") else "metric"
 
 
 def handle_session(data, received):
@@ -102,11 +119,12 @@ def handle_session(data, received):
     with sqlite3.connect(DB_PATH) as conn:
         if action == "start":
             label = (data.get("label") or "").strip() or None
-            cur = conn.execute("INSERT INTO sessions (started, label) VALUES (?, ?)",
-                               (received, label))
+            cur = conn.execute("INSERT INTO sessions (started, label, kind) VALUES (?, ?, ?)",
+                               (received, label, pending_kind))
             conn.commit()
             current_session_id = cur.lastrowid
             print(f"[session] START → id={current_session_id} at {received}"
+                  + f"  kind={pending_kind}"
                   + (f"  label={label!r}" if label else ""))
         elif action == "stop":
             if current_session_id is not None:
@@ -170,7 +188,9 @@ def on_message(client, userdata, msg):
         return
 
     received = datetime.now().isoformat(timespec="seconds")
-    if msg.topic == MQTT_TOPIC_SESSION:
+    if msg.topic == MQTT_TOPIC_CMD:
+        handle_cmd(data)
+    elif msg.topic == MQTT_TOPIC_SESSION:
         handle_session(data, received)
     elif msg.topic == MQTT_TOPIC_ACC:
         handle_acc(data, received, ts)

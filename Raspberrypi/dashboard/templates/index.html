@@ -100,7 +100,10 @@ function fmtElapsed(sec) {
   return m + ":" + String(s).padStart(2, "0");
 }
 function fmtDate(iso) {
-  return new Date(iso).toLocaleDateString([], { weekday:"short", month:"short", day:"numeric", year:"numeric" });
+  // A date-only string ("YYYY-MM-DD") is parsed as UTC midnight, which shifts
+  // the day back in negative-offset timezones. Append a time so it parses as local.
+  const d = iso.length === 10 ? new Date(iso + "T00:00:00") : new Date(iso);
+  return d.toLocaleDateString([], { weekday:"short", month:"short", day:"numeric", year:"numeric" });
 }
 function fmtTime(iso) {
   return new Date(iso).toLocaleTimeString([], { hour:"2-digit", minute:"2-digit" });
