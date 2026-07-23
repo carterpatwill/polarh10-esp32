@@ -506,17 +506,28 @@ void setup() {
     // in a browser and talks to the ESP over MQTT, so the ESP just needs WiFi+BLE.
     WiFi.mode(WIFI_STA);
 
-    // Try eduroam first (10 s) — enterprise WPA2-EAP. Fast blink while searching.
-    Serial.print("[WiFi] Trying eduroam");
-    esp_eap_client_set_identity((uint8_t*)ENT_IDENTITY, strlen(ENT_IDENTITY));
-    esp_eap_client_set_username((uint8_t*)ENT_USER,     strlen(ENT_USER));
-    esp_eap_client_set_password((uint8_t*)ENT_PASS,     strlen(ENT_PASS));
-    esp_wifi_sta_enterprise_enable();
-    WiFi.begin(ENT_SSID);
+    // Try the phone hotspot first (10 s) — it's the network you carry when out
+    // recording. Fast blink while searching.
+    Serial.print("[WiFi] Trying phone hotspot");
+    WiFi.begin(HOME3_SSID, HOME3_PASS);
     waitForWiFi(10000, WIFI_BLINK_MS);
 
-    // Fall back to the personal network (10 s). Tear down enterprise mode first
-    // so the normal WPA2-PSK join isn't confused by leftover EAP config.
+    // Then eduroam (10 s) — enterprise WPA2-EAP.
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.print("\n[WiFi] Trying eduroam");
+        WiFi.disconnect(true);
+        delay(500);
+        WiFi.mode(WIFI_STA);
+        esp_eap_client_set_identity((uint8_t*)ENT_IDENTITY, strlen(ENT_IDENTITY));
+        esp_eap_client_set_username((uint8_t*)ENT_USER,     strlen(ENT_USER));
+        esp_eap_client_set_password((uint8_t*)ENT_PASS,     strlen(ENT_PASS));
+        esp_wifi_sta_enterprise_enable();
+        WiFi.begin(ENT_SSID);
+        waitForWiFi(10000, WIFI_BLINK_MS);
+    }
+
+    // Then the personal network (10 s). Tear down enterprise mode first so the
+    // normal WPA2-PSK join isn't confused by leftover EAP config.
     if (WiFi.status() != WL_CONNECTED) {
         Serial.print("\n[WiFi] Trying personal network");
         esp_wifi_sta_enterprise_disable();
