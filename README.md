@@ -14,7 +14,7 @@ Polar H10 ──BLE──► ESP32 (on body) ──MQTT/TLS──► HiveMQ ─�
 
 ---
 ## Polar H10 
-<img src="images/PolarH10.png" height="200" alt="Polar H10"/>
+<img src="docs/images/PolarH10.png" height="200" alt="Polar H10"/>
 The Polar H10 is univerally considered the **gold standard** for consumer heart rate sensors
 Streams real-time electrocardiogram (ECG) heart rate data and RR-intervals and 3 axis of acceleration data up to 8gs
 allows insights on
@@ -50,11 +50,11 @@ accelerometer
 | **Broker** | HiveMQ Cloud (free tier) | [console](https://console.hivemq.cloud) |
 
 <p>
-<img src="images/PolarH10.png" height="200" alt="Polar H10"/>
-<img src="images/xaioEsp-32.png" height="200" alt="Seeed Studio XIAO ESP32-S3"/>
+<img src="docs/images/PolarH10.png" height="200" alt="Polar H10"/>
+<img src="docs/images/xaioEsp-32.png" height="200" alt="Seeed Studio XIAO ESP32-S3"/>
 <img width="200" height="200" alt="img_3652" src="https://github.com/user-attachments/assets/150e52e8-e693-4eea-bd5e-bb6775d3d75f" />
-<img src="images/3.7LipoBattery.jpg" height="200" alt="LiPo battery"/>
-<img src="images/RasberryPi-1G.jpg" height="200" alt="Raspberry Pi 1GB"/>
+<img src="docs/images/3.7LipoBattery.jpg" height="200" alt="LiPo battery"/>
+<img src="docs/images/RasberryPi-1G.jpg" height="200" alt="Raspberry Pi 1GB"/>
 </p>
 
 ---
@@ -223,7 +223,7 @@ Power it on. It will:
 
 The ESP32 no longer hosts its own web server or WiFi access point — that was too much load alongside BLE + WiFi + MQTT. Instead, a lightweight static page (`web/control.html`, served from **GitHub Pages**) talks straight to the same HiveMQ Cloud broker over MQTT-over-WebSocket. It subscribes to the ESP's status topic and can start/stop a recording session — no same-network requirement, and the ESP just publishes.
 
-<img src="images/control-page.png" width="420" alt="ESP32 Polar control page"/>
+<img src="docs/images/control-page.png" width="420" alt="ESP32 Polar control page"/>
 
 What it shows:
 - a **live connection tree** (MQTT ↔ ESP32 / This page / Pi, and Polar H10 ↔ ESP32) where each link turns green and animates when it's carrying data — the dots on the Polar → ESP32 → MQTT legs flow **upward** toward the broker, tracing the HR data path;
