@@ -13,7 +13,18 @@ PI_HOST="carter@pi4server.local"
 PI_DIR="/home/carter/projects/python/esp-polar/dashboard"   # sibling of server
 # ─────────────────────────────────────────────────────────────────────────────
 
-SRC="$(cd "$(dirname "$0")" && pwd)/Raspberrypi/dashboard/"
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+SRC="$ROOT/Raspberrypi/dashboard/"
+
+# Ship the current trained activity model next to app.py so the timeline feature
+# works on the Pi. Copied fresh each deploy so a retrain always ships the latest.
+MODEL_SRC="$ROOT/data/labeled_data/activity_model.joblib"
+if [ -f "$MODEL_SRC" ]; then
+    cp "$MODEL_SRC" "${SRC}activity_model.joblib"
+    echo "→ Bundled activity model ($(du -h "$MODEL_SRC" | cut -f1))."
+else
+    echo "⚠️  No activity model at $MODEL_SRC — timeline will be unavailable until you train one."
+fi
 
 echo "→ Copying $SRC to $PI_HOST:$PI_DIR ..."
 # keep the Pi's own venv from being clobbered
@@ -24,7 +35,16 @@ echo "→ Installing deps + restarting service on the Pi ..."
 ssh "$PI_HOST" bash -s <<EOF
 set -e
 cd $PI_DIR
-if [ -d .venv ]; then .venv/bin/pip install -q -r requirements.txt; fi
+# ML deps (numpy/scipy/scikit-learn) can be slow or fail on a low-memory Pi.
+# Don't let that abort the deploy — the dashboard degrades gracefully without
+# them (activity band just won't show), so install non-fatally.
+if [ -d .venv ]; then
+    if .venv/bin/pip install -q -r requirements.txt; then
+        echo "  deps installed."
+    else
+        echo "  ⚠️  some deps failed to install — dashboard will run, activity band disabled."
+    fi
+fi
 if systemctl list-unit-files | grep -q '^dashboard.service'; then
     sudo systemctl restart dashboard
     echo "  dashboard restarted."

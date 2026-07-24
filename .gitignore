@@ -13,3 +13,6 @@ esp32/src/config.h
 hr_data.db
 mqtt.env
 data/dumps/
+
+# Activity model bundled into the dashboard at deploy time (source of truth: data/labeled_data/)
+Raspberrypi/dashboard/activity_model.joblib
