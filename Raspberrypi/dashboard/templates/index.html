@@ -5,6 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Polar H10 — Sessions</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<!-- pan/zoom (Hammer.js gives it pinch-to-zoom on touch) -->
+<script src="https://cdn.jsdelivr.net/npm/hammerjs@2.0.8/hammer.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.0.1/dist/chartjs-plugin-zoom.min.js"></script>
 <style>
   :root {
     --bg: #0d1117; --panel: #161b22; --line: #30363d;
@@ -22,10 +25,35 @@
   h1 .sub { color: var(--muted); font-weight: 400; font-size: 13px; }
   .hidden { display: none !important; }
 
+  /* ---- top-level tabs (Workouts | Training) ---- */
+  .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); margin: 0 0 18px; }
+  .tab { background: none; border: none; color: var(--muted); cursor: pointer;
+         font: inherit; font-size: 14px; font-weight: 600; padding: 10px 16px;
+         border-bottom: 2px solid transparent; margin-bottom: -1px; }
+  .tab:hover { color: var(--text); }
+  .tab.active { color: var(--text); border-bottom-color: var(--blue); }
+  .tab .count { color: var(--muted); font-weight: 400; font-size: 12px; margin-left: 6px; }
+  .tab.active .count { color: var(--blue); }
+
+  /* ---- top-level areas (Training vs Workouts) ---- */
+  .area { margin-bottom: 30px; }
+  .area-note { color: var(--muted); font-size: 12px; margin: 0 0 16px; }
+
   /* ---- session list ---- */
   .date-group { margin-bottom: 22px; }
   .date-head { color: var(--muted); font-size: 12px; text-transform: uppercase;
                letter-spacing: .6px; margin: 0 0 8px; font-weight: 600; }
+
+  /* ---- bucket badges (walk/jog/run/sprint/other) ---- */
+  .badge { display: inline-block; font-size: 10px; font-weight: 700; text-transform: uppercase;
+           letter-spacing: .5px; padding: 2px 8px; border-radius: 999px; border: 1px solid;
+           vertical-align: middle; }
+  .badge.walk   { color: var(--blue);  border-color: var(--blue);  background: rgba(88,166,255,.10); }
+  .badge.jog    { color: var(--green); border-color: var(--green); background: rgba(63,185,80,.10); }
+  .badge.run    { color: var(--amber); border-color: var(--amber); background: rgba(210,153,34,.10); }
+  .badge.sprint { color: var(--red);   border-color: var(--red);   background: rgba(248,81,73,.10); }
+  .badge.other,
+  .badge.metric { color: var(--muted); border-color: var(--line);  background: transparent; }
   .session {
     display: flex; align-items: center; gap: 14px; cursor: pointer;
     background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
@@ -49,15 +77,37 @@
   .card .k { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .5px; }
   .card .v { font-size: 22px; font-weight: 700; margin-top: 4px; }
   .chart-wrap { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; margin-bottom: 16px; }
-  .chart-wrap h2 { font-size: 13px; margin: 0 0 10px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .5px; }
-  .chart-box { position: relative; height: 260px; }
+  .chart-wrap h2 { font-size: 13px; margin: 0 0 10px; color: var(--muted); font-weight: 600;
+                   text-transform: uppercase; letter-spacing: .5px;
+                   display: flex; align-items: center; gap: 8px; }
+  .chart-wrap h2 .hint { text-transform: none; letter-spacing: 0; font-weight: 400; color: var(--muted); }
+  .chart-wrap h2 .spacer { flex: 1; }
+  .zoom-reset { text-transform: none; letter-spacing: 0; font: inherit; font-size: 11px;
+                color: var(--muted); background: var(--bg); border: 1px solid var(--line);
+                border-radius: 6px; padding: 3px 9px; cursor: pointer; }
+  .zoom-reset:hover { color: var(--text); border-color: var(--blue); }
+  .chart-box { position: relative; height: 300px; }
+
+  /* ---- activity timeline summary (walk/jog/run/sprint/still %) ---- */
+  .act-summary { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+  .act-chip { display: inline-flex; align-items: center; gap: 6px; font-size: 12px;
+              color: var(--muted); background: var(--bg); border: 1px solid var(--line);
+              border-radius: 999px; padding: 4px 10px; }
+  .act-chip .dot { width: 9px; height: 9px; border-radius: 50%; }
+  .act-chip b { color: var(--text); font-weight: 700; }
 </style>
 </head>
 <body>
 
   <!-- ============ LIST VIEW ============ -->
   <section id="listView">
-    <h1>Sessions <span class="sub">— Polar H10 workouts on the Pi</span></h1>
+    <h1>Sessions <span class="sub">— Polar H10 on the Pi</span></h1>
+    <div class="tabs">
+      <button class="tab" data-tab="workouts" onclick="location.hash='#/workouts'">
+        Workouts <span class="count" id="cntWorkouts"></span></button>
+      <button class="tab" data-tab="training" onclick="location.hash='#/training'">
+        🏋 Training data <span class="count" id="cntTraining"></span></button>
+    </div>
     <div id="sessionList"><div class="empty">Loading…</div></div>
   </section>
 
@@ -74,12 +124,17 @@
       <div class="card"><div class="k">Acc samples</div><div class="v" id="dAcc">–</div></div>
     </div>
     <div class="chart-wrap">
-      <h2>Heart rate (BPM)</h2>
+      <h2>Heart rate (BPM) <span class="spacer"></span>
+        <button class="zoom-reset" onclick="hrChart&&hrChart.resetZoom()">reset zoom</button></h2>
       <div class="chart-box"><canvas id="hrChart"></canvas></div>
     </div>
     <div class="chart-wrap">
-      <h2>Accelerometer (milli-g)</h2>
+      <h2>Accelerometer (milli-g) <span id="accHint" class="hint"></span>
+        <span class="spacer"></span>
+        <button class="zoom-reset" onclick="accChart&&accChart.resetZoom()">reset zoom</button></h2>
       <div class="chart-box"><canvas id="accChart"></canvas></div>
+      <div id="actSummary" class="act-summary"></div>
+      <div class="hint" style="margin-top:8px">Scroll / pinch to zoom · drag to pan left-right · double-click to reset</div>
     </div>
   </section>
 
@@ -111,8 +166,63 @@ function fmtTime(iso) {
 function dayKey(iso) { return iso.slice(0, 10); }  // YYYY-MM-DD
 
 // ---------- list view ----------
-async function loadList() {
+const BUCKET_ORDER = ["walk", "jog", "run", "sprint", "other"];
+
+// One session row. `badge` is optional bucket-colored pill HTML shown by the label.
+function renderSession(s, badge = "") {
+  return `
+    <div class="session" onclick="location.hash='#/session/${s.id}'">
+      <div class="grow">
+        <div class="label">${s.label ? escapeHtml(s.label) : "Session #" + s.id} ${badge}</div>
+        <div class="when">${fmtTime(s.started)} · ${fmtDur(s.duration_s)}</div>
+      </div>
+      <div class="metrics">
+        <div class="metric"><div class="v">${s.hr_count.toLocaleString()}</div><div class="k">HR</div></div>
+        <div class="metric"><div class="v">${s.acc_count.toLocaleString()}</div><div class="k">Acc</div></div>
+      </div>
+      <span class="chev">›</span>
+    </div>`;
+}
+
+function bucketBadge(bucket) {
+  return bucket ? `<span class="badge ${bucket}">${bucket}</span>` : "";
+}
+
+// Training tab: sessions grouped by activity bucket (walk/jog/run/sprint/other).
+function renderTraining(training) {
+  if (!training.length) return `<div class="empty">No training data yet. Record labeled walks/jogs/runs.</div>`;
+  const byBucket = {};
+  for (const s of training) (byBucket[s.bucket || "other"] ??= []).push(s);
+  const buckets = BUCKET_ORDER.filter(b => byBucket[b]);
+  const body = buckets.map(b => `
+    <div class="date-group">
+      <div class="date-head">${bucketBadge(b)} <span style="margin-left:6px">${byBucket[b].length} session(s)</span></div>
+      ${byBucket[b].map(s => renderSession(s, bucketBadge(b))).join("")}
+    </div>`).join("");
+  return `<div class="area">
+    <div class="area-note">Short, single-activity recordings that teach the model. Click one to see exactly what X/Y/Z do.</div>
+    ${body}</div>`;
+}
+
+// Workouts tab: real recordings, grouped by calendar day (newest first).
+function renderWorkouts(workouts) {
+  if (!workouts.length) return `<div class="empty">No workouts recorded yet.</div>`;
+  const byDay = {};
+  for (const s of workouts) (byDay[dayKey(s.started)] ??= []).push(s);
+  const body = Object.entries(byDay).map(([day, items]) => `
+    <div class="date-group">
+      <div class="date-head">${fmtDate(day)}</div>
+      ${items.map(s => renderSession(s)).join("")}
+    </div>`).join("");
+  return `<div class="area">${body}</div>`;
+}
+
+async function loadList(tab) {
   const box = document.getElementById("sessionList");
+  // Mark the active tab immediately so the click feels responsive.
+  document.querySelectorAll(".tab").forEach(t =>
+    t.classList.toggle("active", t.dataset.tab === tab));
+
   let sessions;
   try {
     sessions = await fetch("/api/sessions").then(r => r.json());
@@ -120,30 +230,13 @@ async function loadList() {
     box.innerHTML = `<div class="empty">Couldn't load sessions: ${e.message}</div>`;
     return;
   }
-  if (!sessions.length) {
-    box.innerHTML = `<div class="empty">No recorded sessions yet.</div>`;
-    return;
-  }
-  // group by calendar day (already sorted newest-first by the API)
-  const groups = {};
-  for (const s of sessions) (groups[dayKey(s.started)] ??= []).push(s);
+  // Training data (kind='train') has its own tab; everything else is a workout.
+  const training = sessions.filter(s => s.kind === "train");
+  const workouts = sessions.filter(s => s.kind !== "train");
+  document.getElementById("cntTraining").textContent = training.length || "";
+  document.getElementById("cntWorkouts").textContent = workouts.length || "";
 
-  box.innerHTML = Object.entries(groups).map(([day, items]) => `
-    <div class="date-group">
-      <div class="date-head">${fmtDate(day)}</div>
-      ${items.map(s => `
-        <div class="session" onclick="location.hash='#/session/${s.id}'">
-          <div class="grow">
-            <div class="label">${s.label ? escapeHtml(s.label) : "Session #" + s.id}</div>
-            <div class="when">${fmtTime(s.started)} · ${fmtDur(s.duration_s)}</div>
-          </div>
-          <div class="metrics">
-            <div class="metric"><div class="v">${s.hr_count.toLocaleString()}</div><div class="k">HR</div></div>
-            <div class="metric"><div class="v">${s.acc_count.toLocaleString()}</div><div class="k">Acc</div></div>
-          </div>
-          <span class="chev">›</span>
-        </div>`).join("")}
-    </div>`).join("");
+  box.innerHTML = tab === "training" ? renderTraining(training) : renderWorkouts(workouts);
 }
 
 function escapeHtml(s) {
@@ -153,13 +246,54 @@ function escapeHtml(s) {
 // ---------- detail view ----------
 let hrChart, accChart;
 
-function mkChart(id, datasets, yTitle) {
-  return new Chart(document.getElementById(id), {
+// Colors for the activity timeline (match the bucket badges; still = grey).
+const ACT_COLOR = { walk:"#58a6ff", jog:"#3fb950", run:"#d29922", sprint:"#f85149", still:"#8b949e", other:"#8b949e" };
+
+// Draws the model's activity segments as a colored band under the chart, with a
+// dashed divider line at each transition timestamp and a label per segment.
+// Reads chart.$activity = [{t0,t1,activity}]; needs ~34px of bottom padding.
+const activityBand = {
+  id: "activityBand",
+  afterDatasetsDraw(chart) {
+    const segs = chart.$activity;
+    if (!segs || !segs.length) return;
+    const { ctx, chartArea: a, scales } = chart;
+    const xs = scales.x, bandTop = a.bottom + 8, bandH = 16;
+    ctx.save();
+    ctx.font = "700 9px -apple-system, sans-serif";
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    for (const s of segs) {
+      const x0 = Math.max(a.left, xs.getPixelForValue(s.t0));
+      const x1 = Math.min(a.right, xs.getPixelForValue(s.t1));
+      if (x1 <= x0) continue;
+      const col = ACT_COLOR[s.activity] || "#8b949e";
+      // colored band segment
+      ctx.globalAlpha = 0.9; ctx.fillStyle = col;
+      ctx.fillRect(x0, bandTop, x1 - x0, bandH);
+      // divider line up through the plot at the transition timestamp
+      ctx.globalAlpha = 0.22; ctx.strokeStyle = col; ctx.setLineDash([3, 3]);
+      ctx.beginPath(); ctx.moveTo(x0, a.top); ctx.lineTo(x0, bandTop + bandH); ctx.stroke();
+      ctx.setLineDash([]);
+      // label if the segment is wide enough to read
+      if (x1 - x0 > 30) {
+        ctx.globalAlpha = 1; ctx.fillStyle = "#0d1117";
+        ctx.fillText(s.activity.toUpperCase(), (x0 + x1) / 2, bandTop + bandH / 2 + .5);
+      }
+    }
+    ctx.restore();
+  }
+};
+
+function mkChart(id, datasets, yTitle, opts = {}) {
+  const canvas = document.getElementById(id);
+  const chart = new Chart(canvas, {
     type: "line",
     data: { datasets },
+    plugins: opts.plugins || [],
     options: {
       animation: false, parsing: false, normalized: true,
       responsive: true, maintainAspectRatio: false,
+      layout: { padding: { bottom: opts.bottomPad || 0 } },
       interaction: { mode: "nearest", axis: "x", intersect: false },
       elements: { point: { radius: 0 }, line: { borderWidth: 1.5, tension: .2 } },
       scales: {
@@ -170,18 +304,59 @@ function mkChart(id, datasets, yTitle) {
       },
       plugins: {
         legend: { display: datasets.length > 1, labels: { boxWidth: 12 } },
-        tooltip: { callbacks: { title: items => fmtElapsed(items[0].parsed.x) } }
+        tooltip: { callbacks: { title: items => fmtElapsed(items[0].parsed.x) } },
+        zoom: {
+          pan:  { enabled: true, mode: "x" },                       // drag to scroll left/right
+          zoom: { wheel: { enabled: true }, pinch: { enabled: true }, mode: "x" },
+          limits: { x: { min: "original", max: "original" } }       // can't scroll past the data
+        }
       }
     }
   });
+  canvas.ondblclick = () => chart.resetZoom();
+  return chart;
+}
+
+// Fetch the model's activity timeline and paint it onto the acc chart + summary.
+async function loadActivity(sid) {
+  const summary = document.getElementById("actSummary");
+  const hint = document.getElementById("accHint");
+  summary.innerHTML = ""; hint.textContent = "";
+  let d;
+  try {
+    d = await fetch(`/api/session/${sid}/timeline`).then(r => r.json());
+  } catch (e) { return; }
+  if (!accChart || d.error || !d.segments || !d.segments.length) {
+    if (d && d.error) hint.textContent = "· activity guess unavailable";
+    return;
+  }
+  accChart.$activity = d.segments;
+  accChart.update();
+  if (hrChart) { hrChart.$activity = d.segments; hrChart.update(); }   // same band on HR
+  hint.textContent = "· colored band = model's activity guess";
+
+  // Percentage summary chips, biggest first.
+  const total = Object.values(d.totals).reduce((a, b) => a + b, 0) || 1;
+  summary.innerHTML = Object.entries(d.totals)
+    .sort((a, b) => b[1] - a[1])
+    .map(([act, secs]) => `
+      <span class="act-chip">
+        <span class="dot" style="background:${ACT_COLOR[act] || "#8b949e"}"></span>
+        ${act} <b>${Math.round(100 * secs / total)}%</b>
+        <span style="color:var(--muted)">· ${fmtDur(Math.round(secs))}</span>
+      </span>`).join("");
 }
 
 async function loadDetail(sid) {
   const d = await fetch("/api/session/" + sid).then(r => r.json());
   if (d.error) { document.getElementById("dTitle").textContent = "Session not found"; return; }
 
-  document.getElementById("dTitle").textContent =
-    (d.label || "Session #" + d.id) + "  ·  " + fmtDate(d.started) + " " + fmtTime(d.started);
+  const badge = d.kind === "train"
+    ? ` <span class="badge ${d.bucket || "other"}">training · ${d.bucket || "other"}</span>`
+    : "";
+  document.getElementById("dTitle").innerHTML =
+    escapeHtml(d.label || "Session #" + d.id) + badge +
+    "  ·  " + fmtDate(d.started) + " " + fmtTime(d.started);
   const st = d.stats || {};
   document.getElementById("dDur").textContent = fmtDur(d.duration_s);
   document.getElementById("dAvg").textContent = st.avg ?? "–";
@@ -200,12 +375,14 @@ async function loadDetail(sid) {
   hrChart = mkChart("hrChart", [
     { label: "BPM", data: hrData, borderColor: "#f85149", fill: true,
       backgroundColor: "rgba(248,81,73,.08)" }
-  ], "BPM");
+  ], "BPM", { plugins: [activityBand], bottomPad: 34 });
   accChart = mkChart("accChart", [
     { label: "X", data: ax, borderColor: "#58a6ff" },
     { label: "Y", data: ay, borderColor: "#3fb950" },
     { label: "Z", data: az, borderColor: "#d29922" },
-  ], "milli-g");
+  ], "milli-g", { plugins: [activityBand], bottomPad: 34 });
+
+  loadActivity(d.id);   // overlay the model's activity guess (async)
 }
 
 // ---------- tiny hash router ----------
@@ -221,7 +398,8 @@ function route() {
   } else {
     detail.classList.add("hidden");
     list.classList.remove("hidden");
-    loadList();
+    const tab = location.hash === "#/training" ? "training" : "workouts";
+    loadList(tab);
   }
 }
 

@@ -1,1 +1,9 @@
 flask>=3.0
+# Activity-timeline feature: run the trained walk/jog/run/sprint model on the Pi.
+# Pinned to match the machine that trained/pickled activity_model.joblib so it
+# unpickles cleanly. If these fail to install (e.g. low memory), the dashboard
+# still runs — only the activity band is skipped (the endpoint returns 501).
+numpy==2.2.6
+scipy==1.15.3
+scikit-learn==1.7.2
+joblib==1.5.3
