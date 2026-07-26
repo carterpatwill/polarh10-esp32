@@ -274,12 +274,15 @@ static void onPmdControl(NimBLERemoteCharacteristic*, uint8_t* data, size_t len,
 // blinks while connecting/scanning and lights solid once a Polar strap connects.
 static constexpr int PIN_BL = PIN_STATUS_LED;
 
-// Status-LED blink rates convey what the board is searching for:
-//   fast blink  → looking for WiFi
-//   slow blink  → WiFi up, scanning for the Polar strap over BLE
-//   solid on    → both connected (see connectToPolar)
+// Status-LED states convey how close to "fully online" the board is (see
+// updateStatusLed, which is the single source of truth now):
+//   fast blink  → looking for WiFi (uplink down)
+//   slow blink  → WiFi up, but the strap or the MQTT broker isn't connected
+//   solid on    → fully online: WiFi + broker + strap all connected
 static constexpr uint32_t WIFI_BLINK_MS = 120;   // fast
 static constexpr uint32_t BLE_BLINK_MS  = 700;   // slow
+// How long to let the SDK's auto-reconnect try before re-walking the network list.
+static constexpr uint32_t WIFI_RECONNECT_MS = 10000;
 
 static void flashOnBL(int times = 3) {
     for (int i = 0; i < times; i++) {
@@ -485,26 +488,14 @@ static void sendAccBatch() {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-void setup() {
-    // Optional peripheral power-enable (unused on the XIAO; PIN_POWER_ON = -1).
-    if (PIN_POWER_ON >= 0) {
-        pinMode(PIN_POWER_ON, OUTPUT);
-        digitalWrite(PIN_POWER_ON, HIGH);
-    }
-
-    pinMode(PIN_BL, OUTPUT);
-    digitalWrite(PIN_BL, HIGH);
-
-    Serial.begin(115200);
-    delay(1000);
-
-    hrQueue  = xQueueCreate(QUEUE_LEN, sizeof(HRReading));
-    accQueue = xQueueCreate(QUEUE_LEN_ACC, sizeof(ACCSample));
-
-    // Station-only: no SoftAP / web server / captive portal. The control page runs
-    // in a browser and talks to the ESP over MQTT, so the ESP just needs WiFi+BLE.
+// ── Join WiFi: walk the network list, blocking until one connects ─────────────
+// Called once at boot and again from the loop whenever the link drops. The last
+// network waits forever, so this always returns with WiFi up.
+static void connectWiFi() {
     WiFi.mode(WIFI_STA);
+    WiFi.persistent(false);       // don't wear out flash rewriting creds every boot
+    WiFi.setSleep(false);         // no modem sleep — flaky hotspots drop dozing clients
+    WiFi.setAutoReconnect(true);  // let the SDK rejoin the last AP on brief blips
 
     // Try the phone hotspot first (10 s) — it's the network you carry when out
     // recording. Fast blink while searching.
@@ -551,6 +542,50 @@ void setup() {
     Serial.printf("\n[WiFi] Connected to '%s' (%d dBm), IP: %s\n",
                   WiFi.SSID().c_str(), (int)WiFi.RSSI(),
                   WiFi.localIP().toString().c_str());
+}
+
+// ── Keep WiFi alive: give the SDK a moment, then re-run the full join ─────────
+// setAutoReconnect handles brief blips silently. If the link is still down after
+// WIFI_RECONNECT_MS (e.g. the hotspot vanished), re-walk the list so we can fall
+// over to another network, then bring the broker back up.
+static uint32_t wifiDownSince = 0;
+static void ensureWiFi() {
+    if (WiFi.status() == WL_CONNECTED) { wifiDownSince = 0; return; }
+
+    uint32_t now = millis();
+    if (wifiDownSince == 0) {
+        wifiDownSince = now;
+        Serial.println("[WiFi] Link down — waiting for auto-reconnect");
+    }
+    if (now - wifiDownSince >= WIFI_RECONNECT_MS) {
+        Serial.println("[WiFi] Still down — re-running full connect sequence");
+        connectWiFi();     // blocks until some network joins
+        wifiDownSince = 0;
+        mqttConnect();     // follow WiFi back up so the control page sees us again
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+void setup() {
+    // Optional peripheral power-enable (unused on the XIAO; PIN_POWER_ON = -1).
+    if (PIN_POWER_ON >= 0) {
+        pinMode(PIN_POWER_ON, OUTPUT);
+        digitalWrite(PIN_POWER_ON, HIGH);
+    }
+
+    pinMode(PIN_BL, OUTPUT);
+    digitalWrite(PIN_BL, HIGH);
+
+    Serial.begin(115200);
+    delay(1000);
+
+    hrQueue  = xQueueCreate(QUEUE_LEN, sizeof(HRReading));
+    accQueue = xQueueCreate(QUEUE_LEN_ACC, sizeof(ACCSample));
+
+    // Station-only: no SoftAP / web server / captive portal. The control page runs
+    // in a browser and talks to the ESP over MQTT, so the ESP just needs WiFi+BLE.
+    // connectWiFi() walks the network list and blocks until one joins.
+    connectWiFi();
 
     flashOnBL();
 
@@ -582,27 +617,44 @@ static uint32_t lastBLTick    = 0;
 static uint32_t lastStatusPub = 0;
 static bool     blState       = false;
 
+// Drive the status LED so it tells the whole truth, not just the BLE link:
+//   fast blink → WiFi down    slow blink → WiFi up but strap or broker missing
+//   solid on   → fully online (WiFi + broker + strap all connected)
+// Previously the LED went solid the moment the strap connected, so it stayed lit
+// even when the uplink had dropped and the control page couldn't see the ESP.
+static void updateStatusLed() {
+    bool wifiUp = WiFi.status() == WL_CONNECTED;
+    if (wifiUp && mqtt.connected() && connected) {
+        digitalWrite(PIN_BL, LOW);   // solid = control page sees us AND the strap is live
+        return;
+    }
+    uint32_t period = wifiUp ? BLE_BLINK_MS : WIFI_BLINK_MS;
+    uint32_t now = millis();
+    if (now - lastBLTick >= period) {
+        lastBLTick = now;
+        blState = !blState;
+        digitalWrite(PIN_BL, blState ? HIGH : LOW);
+    }
+}
+
 void loop() {
     if (mqtt.connected()) mqtt.loop();
     else                  receiverOk = false;
+
+    ensureWiFi();   // bring the uplink back if it dropped (was: offline until reboot)
 
     if (doConnect) {
         doConnect = false;
         connectToPolar();
     }
 
-    if (!connected && pClient == nullptr) {
-        if (!NimBLEDevice::getScan()->isScanning()) {
-            NimBLEDevice::getScan()->start(0, false);
-            Serial.println("[BLE] Restarted scan");
-        }
-        uint32_t now = millis();
-        if (now - lastBLTick >= BLE_BLINK_MS) {   // slow blink: WiFi up, scanning for the strap
-            lastBLTick = now;
-            blState = !blState;
-            digitalWrite(PIN_BL, blState ? HIGH : LOW);
-        }
+    // No strap: keep the BLE scan running so we can find it again.
+    if (!connected && pClient == nullptr && !NimBLEDevice::getScan()->isScanning()) {
+        NimBLEDevice::getScan()->start(0, false);
+        Serial.println("[BLE] Restarted scan");
     }
+
+    updateStatusLed();
 
     if (millis() - lastSend >= BATCH_MS) {
         lastSend = millis();

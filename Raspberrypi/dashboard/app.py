@@ -21,7 +21,9 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 
-from flask import Flask, jsonify, render_template
+import sys
+
+from flask import Flask, jsonify, render_template, request
 
 # The receiver's DB sits in a sibling folder by default (see deploy-dashboard.sh).
 DEFAULT_DB = Path(__file__).resolve().parent.parent / "server" / "hr_data.db"
@@ -51,13 +53,13 @@ app = Flask(__name__)
 app.config["TEMPLATES_AUTO_RELOAD"] = True
 
 # Which activity bucket a training label belongs to (mirrors data/activity.py).
-# A label joins a bucket if it contains any of that bucket's keywords.
-BUCKETS = ["walk", "jog", "run", "sprint", "other"]
+# A label joins a bucket if it contains any of that bucket's keywords. "sprint" is
+# folded into "run" to match the trained model (see data/activity.py).
+BUCKETS = ["walk", "jog", "run", "other"]
 BUCKET_KEYWORDS = {
     "walk":   ["walk"],
     "jog":    ["jog"],
-    "run":    ["run"],
-    "sprint": ["sprint"],
+    "run":    ["run", "sprint"],
     "other":  ["other", "misc", "idle", "sit", "stand", "still", "rest", "random"],
 }
 
@@ -262,6 +264,77 @@ def session_timeline(sid):
     if len(samples) == 0:
         return jsonify({"error": "no accelerometer data for this session"}), 404
     return jsonify(analyze(samples, bundle))
+
+
+# ── Self-service labeler (LOCAL ONLY) ─────────────────────────────────────────────
+# These endpoints let you grow the training library from the browser: see new
+# recordings, auto-trim the start/stop ramp, label jog/run/walk, and retrain — all
+# without the terminal. The logic lives in data/library_api.py (next to the trainer
+# and the library). On the Pi that folder isn't deployed, so the import fails and
+# the labeler simply isn't available — the workout dashboard is unaffected.
+_DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
+
+
+def _labeler():
+    """Import data/library_api, or None if it (or its deps) aren't here (e.g. Pi)."""
+    if str(_DATA_DIR) not in sys.path:
+        sys.path.insert(0, str(_DATA_DIR))
+    try:
+        import library_api
+        return library_api
+    except Exception:
+        return None
+
+
+@app.route("/label")
+def label_page():
+    return render_template("label.html", available=_labeler() is not None)
+
+
+@app.route("/api/label/candidates")
+def label_candidates():
+    lab = _labeler()
+    if lab is None:
+        return jsonify({"error": "labeler unavailable (run the dashboard locally on the Mac)"}), 501
+    return jsonify(lab.candidates())
+
+
+@app.route("/api/label/library")
+def label_library():
+    lab = _labeler()
+    if lab is None:
+        return jsonify({"error": "labeler unavailable"}), 501
+    return jsonify(lab.library())
+
+
+@app.route("/api/label/add", methods=["POST"])
+def label_add():
+    lab = _labeler()
+    if lab is None:
+        return jsonify({"error": "labeler unavailable"}), 501
+    d = request.get_json(force=True)
+    res = lab.add(int(d["id"]), d["bucket"],
+                  t0=d.get("t0"), t1=d.get("t1"), note=d.get("note", ""))
+    return jsonify(res), (400 if "error" in res else 200)
+
+
+@app.route("/api/label/remove", methods=["POST"])
+def label_remove():
+    lab = _labeler()
+    if lab is None:
+        return jsonify({"error": "labeler unavailable"}), 501
+    d = request.get_json(force=True)
+    res = lab.remove(int(d["id"]))
+    return jsonify(res), (400 if "error" in res else 200)
+
+
+@app.route("/api/label/train", methods=["POST"])
+def label_train():
+    lab = _labeler()
+    if lab is None:
+        return jsonify({"error": "labeler unavailable"}), 501
+    res = lab.train_and_save()
+    return jsonify(res), (400 if "error" in res else 200)
 
 
 if __name__ == "__main__":

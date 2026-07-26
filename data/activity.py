@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""Guess the activity — walk / jog / run / sprint — from Polar H10 motion data.
+"""Guess the activity — walk / jog / run — from Polar H10 motion data.
 
 Companion to steps.py:
     steps.py     answers "how many steps?"   (a number)
-    activity.py  answers "what activity?"     (a bucket: walk/jog/run/sprint/other)
+    activity.py  answers "what activity?"     (a bucket: walk/jog/run/still)
 
-'other' is a catch-all bucket for motion that isn't walking/running — sitting,
-arm waving, fidgeting. Label such a session with a word like "other", "sit",
-"stand", "rest", or "idle" (or force it in with `add <id> --as other`).
+"still" (not moving — sitting, standing) isn't a learned bucket: a motionless
+body has almost no motion energy (intensity ≈ 4) while even the slowest walk is
+≈90+, so it's a plain intensity threshold applied before the model runs. See
+STILL_INTENSITY. Don't record sitting sessions to train on — the threshold
+already handles it, and the step detector counts sensor noise as fake steps when
+you're still, which only confuses a learned model.
 
 ────────────────────────────────────────────────────────────────────────────────
 TWO PLACES DATA LIVES  (this is the whole mental model)
@@ -31,7 +34,7 @@ THE WORKFLOW  (five commands, in the order you use them)
     2.  python activity.py buckets     See how many example sessions you have in
                                        each bucket. Spot which buckets need more.
 
-    3.  python activity.py train       Learn walk/jog/run/sprint from the LIBRARY.
+    3.  python activity.py train       Learn walk/jog/run from the LIBRARY.
 
     4.  python activity.py guess        Point it at a new recording and get the
         python activity.py guess 14     activity, second-by-second.
@@ -62,24 +65,31 @@ STEP_PARAMS = DATA_DIR / "steps_model.json"                 # from `steps.py cal
 CLF_FILE    = DATA_DIR / "labeled_data" / "activity_model.joblib"  # the trained guesser
 
 # ── The buckets ──────────────────────────────────────────────────────────────────
-# walk → sprint are the step-based (gait) buckets, slowest to fastest.
-# 'other' is a catch-all for motion that ISN'T one of those — sitting, arm waving,
-# fidgeting, etc. Having it lets the guesser answer "none of the gait ones" instead
-# of being forced to pick walk/jog/run when nothing really fits.
-BUCKETS = ["walk", "jog", "run", "sprint", "other"]
+# walk → run are the step-based (gait) buckets, slowest to fastest. These are
+# the only things the model learns. "Not moving" is NOT a bucket here — it's a
+# threshold (STILL_INTENSITY), because it's trivially separable and the model was
+# only ever confused by it.
+# NOTE: "sprint" is folded into "run" — the distinction wasn't worth the confusion
+# it caused (walk<->sprint swaps) and both were small, short buckets. Sessions
+# still labeled "Sprint..." re-bucket into run automatically via the keyword below.
+BUCKETS = ["walk", "jog", "run"]
 
 # A label joins a bucket if it contains any of that bucket's keywords.
 BUCKET_KEYWORDS = {
     "walk":   ["walk"],
     "jog":    ["jog"],
-    "run":    ["run"],
-    "sprint": ["sprint"],
-    "other":  ["other", "misc", "idle", "sit", "stand", "still", "rest", "random"],
+    "run":    ["run", "sprint"],
 }
 
 # ── How motion is described to the guesser ───────────────────────────────────────
 WINDOW_SEC    = 2.0                                          # one analyzed slice
 FEATURE_NAMES = ["cadence", "intensity", "footfall_punch"]
+
+# Below this motion-energy (the 'intensity' feature) a slice is called "still"
+# before the model is even consulted. Sitting measures ≈4, the slowest walk ≈90+,
+# so anything in between is safe; 30 leaves plenty of headroom on both sides.
+STILL_INTENSITY = 30.0
+STILL_LABEL     = "still"
 
 # A session, with everything we care about in one place.
 Session = namedtuple("Session", "id label started acc_rows bucket")
@@ -192,7 +202,7 @@ def cmd_add(args):
         elif kind == "metric" and not forced:
             reason = "kind=metric (real workout, not training) — use --as to force"
         elif bucket is None:
-            reason = "label has no walk/jog/run/sprint keyword (use --as)"
+            reason = "label has no walk/jog/run keyword (use --as)"
         elif started in have:
             reason = "already in library"
         if reason:
@@ -253,11 +263,72 @@ def cmd_buckets(args):
     print("\nAim for a few sessions in each bucket, then:  python activity.py train")
 
 
-def cmd_train(args):
-    """Learn walk/jog/run/sprint from every session in the library."""
+# ── Reusable training core (shared by the CLI and the web labeler) ────────────────
+# These build the model without printing or saving, so both `cmd_train` and
+# library_api.train_and_save() learn from the library the exact same way.
+def build_examples(conn, sessions, params, on_session=None):
+    """Turn library sessions into (X, y, groups) — one row per 2-second slice.
+
+    groups holds the session id each slice came from, so an honest score can hide
+    a whole session at once. `on_session(session, n_slices)` is called per session
+    (lets the CLI print progress); pass None to stay quiet."""
+    X, y, groups = [], [], []
+    for s in sessions:
+        samples = steps.load_session_acc(conn, s.id)
+        n = 0
+        for _, feats in slices(samples, params):
+            X.append(feats); y.append(s.bucket); groups.append(s.id); n += 1
+        if on_session:
+            on_session(s, n)
+    return np.array(X), np.array(y), np.array(groups)
+
+
+def fit_and_report(X, y, groups):
+    """Fit the classifier and score it honestly (leave-one-session-out).
+
+    Returns (fitted_clf, present_buckets, report) where report is a plain dict
+    the web UI can render:
+        {accuracy, per_class:{bucket:{precision,recall,f1,support}}, empty:[...],
+         confusion:{labels:[...], matrix:[[...]]}, scored:bool, note:str|None}"""
     from sklearn.ensemble import RandomForestClassifier
     from sklearn.model_selection import LeaveOneGroupOut, cross_val_predict
     from sklearn.metrics import classification_report, confusion_matrix
+
+    present = sorted(set(y), key=BUCKETS.index)
+    empty = [b for b in BUCKETS if b not in present]
+    report = {"per_class": {}, "empty": empty, "confusion": None,
+              "accuracy": None, "scored": False, "note": None}
+
+    clf = RandomForestClassifier(n_estimators=200, min_samples_leaf=2,
+                                 class_weight="balanced", random_state=0)
+
+    # Honest score: hide one whole session at a time and guess it from the rest.
+    if len(set(groups)) > 1 and len(present) > 1:
+        try:
+            pred = cross_val_predict(clf, X, y, groups=groups, cv=LeaveOneGroupOut())
+            rep = classification_report(y, pred, zero_division=0, output_dict=True)
+            report["accuracy"] = rep["accuracy"]
+            for b in present:
+                r = rep.get(b, {})
+                report["per_class"][b] = {"precision": r.get("precision"),
+                                          "recall": r.get("recall"),
+                                          "f1": r.get("f1-score"),
+                                          "support": r.get("support")}
+            report["confusion"] = {
+                "labels": present,
+                "matrix": confusion_matrix(y, pred, labels=present).tolist()}
+            report["scored"] = True
+        except Exception as e:
+            report["note"] = f"couldn't score yet: {e}"
+    else:
+        report["note"] = "Need ≥2 sessions across ≥2 buckets for an honest score."
+
+    clf.fit(X, y)
+    return clf, present, report
+
+
+def cmd_train(args):
+    """Learn walk/jog/run from every session in the library."""
     import joblib
 
     conn = sqlite3.connect(LIBRARY_DB)
@@ -266,41 +337,28 @@ def cmd_train(args):
     if not sessions:
         raise SystemExit("Library is empty. Add some labeled walks:  python activity.py add")
 
-    # Build the examples: one row per 2-second slice.
-    X, y, groups = [], [], []
     print("Learning from:")
-    for s in sessions:
-        samples = steps.load_session_acc(conn, s.id)
-        n = 0
-        for _, feats in slices(samples, params):
-            X.append(feats); y.append(s.bucket); groups.append(s.id); n += 1
-        print(f"  #{s.id:<3} {s.label!r:<20} → {s.bucket:<7} ({n} slices)")
+    X, y, groups = build_examples(
+        conn, sessions, params,
+        on_session=lambda s, n: print(f"  #{s.id:<3} {s.label!r:<20} → {s.bucket:<7} ({n} slices)"))
     conn.close()
-    X, y, groups = np.array(X), np.array(y), np.array(groups)
 
-    present = sorted(set(y), key=BUCKETS.index)
-    empty   = [b for b in BUCKETS if b not in present]
+    clf, present, report = fit_and_report(X, y, groups)
+
     print(f"\nBuckets with data : {present}")
-    if empty:
-        print(f"Buckets still empty: {empty}  (record labeled sessions to fill them)")
-
-    clf = RandomForestClassifier(n_estimators=200, min_samples_leaf=2,
-                                 class_weight="balanced", random_state=0)
-
-    # Honest score: hide one whole session at a time and guess it from the rest.
-    if len(set(groups)) > 1 and len(present) > 1:
-        print("\nHonest accuracy (guessing sessions it never trained on):")
-        try:
-            pred = cross_val_predict(clf, X, y, groups=groups, cv=LeaveOneGroupOut())
-            print(classification_report(y, pred, zero_division=0))
-            print("Confusion (rows = actual, cols = guessed):", present)
-            print(confusion_matrix(y, pred, labels=present))
-        except Exception as e:
-            print(f"  (couldn't score yet: {e})")
+    if report["empty"]:
+        print(f"Buckets still empty: {report['empty']}  (record labeled sessions to fill them)")
+    if report["scored"]:
+        print(f"\nHonest accuracy: {report['accuracy']:.2f}  (guessing sessions it never trained on)")
+        for b, m in report["per_class"].items():
+            print(f"  {b:<7} precision {m['precision']:.2f}  recall {m['recall']:.2f}  "
+                  f"f1 {m['f1']:.2f}  (n={m['support']:.0f})")
+        print("\nConfusion (rows = actual, cols = guessed):", report["confusion"]["labels"])
+        for row in report["confusion"]["matrix"]:
+            print("  ", row)
     else:
-        print("\n(Need ≥2 sessions across ≥2 buckets for an honest score.)")
+        print(f"\n({report['note']})")
 
-    clf.fit(X, y)
     joblib.dump({"model": clf, "buckets": present, "features": FEATURE_NAMES,
                  "step_params": params}, CLF_FILE)
     print(f"\nSaved guesser → {CLF_FILE}")
@@ -310,11 +368,20 @@ def cmd_train(args):
 def _predict(bundle, samples) -> tuple[str, float, list]:
     """Run the guesser on one session's samples → (overall_bucket, share%, per-slice preds)."""
     params = bundle["step_params"]
-    feats = [f for _, f in slices(samples, params)]
-    if not feats:
+    feats = np.array([f for _, f in slices(samples, params)])
+    if not len(feats):
         raise SystemExit("Recording too short to guess.")
-    preds = bundle["model"].predict(np.array(feats))
-    conf  = bundle["model"].predict_proba(np.array(feats)).max(axis=1)
+    preds = bundle["model"].predict(feats).astype(object)
+    conf  = bundle["model"].predict_proba(feats).max(axis=1)
+
+    # "Still" is a threshold, not a learned class. A motionless body has almost no
+    # motion energy, but the step detector still counts sensor noise as fake steps,
+    # so cadence/punch lie — intensity is the one honest feature. Override any
+    # low-energy slice before we trust the model's gait guess.
+    still = feats[:, 1] < STILL_INTENSITY
+    preds[still] = STILL_LABEL
+    conf[still]  = 1.0
+
     vals, cnts = np.unique(preds, return_counts=True)
     overall = vals[np.argmax(cnts)]
     share = 100 * cnts.max() / len(preds)
@@ -372,15 +439,15 @@ def cmd_demo(args):
 
 # ════════════════════════════════════════════════════════════════════════════════
 def main():
-    p = argparse.ArgumentParser(description="Guess walk/jog/run/sprint from ACC data.")
+    p = argparse.ArgumentParser(description="Guess walk/jog/run from ACC data.")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     a = sub.add_parser("add", help="file the latest dump's labeled sessions into the library")
     a.add_argument("session", nargs="?", type=int, help="only add this dump session id")
-    a.add_argument("--as", dest="as_bucket", help="force into a bucket: walk/jog/run/sprint")
+    a.add_argument("--as", dest="as_bucket", help="force into a bucket: walk/jog/run")
 
     sub.add_parser("buckets", help="show how many example sessions each bucket has")
-    sub.add_parser("train", help="learn walk/jog/run/sprint from the library")
+    sub.add_parser("train", help="learn walk/jog/run from the library")
 
     g = sub.add_parser("guess", help="guess the activity of a recording")
     g.add_argument("session", nargs="?", type=int, help="session id (default: most recent)")

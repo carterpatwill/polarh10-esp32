@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Label & Train</title>
+<style>
+  :root {
+    --bg:#0d1117; --panel:#161b22; --line:#30363d; --text:#e6edf3;
+    --muted:#8b949e; --blue:#58a6ff; --red:#f85149; --green:#3fb950; --amber:#d29922;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0 auto; max-width:1100px; padding:16px; background:var(--bg);
+         color:var(--text); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+  a { color:var(--blue); text-decoration:none; }
+  h1 { font-size:20px; margin:0 0 4px; font-weight:600; }
+  .sub { color:var(--muted); font-size:13px; margin:0 0 18px; }
+  .hidden { display:none !important; }
+  .row { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px;
+           padding:14px 16px; margin-bottom:12px; }
+
+  /* library summary */
+  .lib { display:flex; gap:10px; flex-wrap:wrap; }
+  .chip { border:1px solid var(--line); border-radius:999px; padding:4px 12px; font-size:13px; }
+  .chip b { color:var(--text); } .chip { color:var(--muted); }
+  .chip.walk b{color:var(--blue)} .chip.jog b{color:var(--green)} .chip.run b{color:var(--amber)}
+
+  /* candidate card */
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px;
+          padding:14px 16px; margin-bottom:10px; }
+  .card.done { opacity:.55; }
+  .card h3 { margin:0; font-size:15px; font-weight:600; }
+  .card .meta { color:var(--muted); font-size:12px; }
+
+  /* intensity bar */
+  .bars { display:flex; align-items:flex-end; gap:1px; height:56px; margin:10px 0 6px;
+          background:#0b0f14; border:1px solid var(--line); border-radius:6px; padding:4px; overflow:hidden; }
+  .bar { flex:1 1 0; min-width:1px; background:#2d333b; border-radius:1px; }
+  .bar.keep { background:var(--amber); }
+  .axis { color:var(--muted); font-size:11px; display:flex; justify-content:space-between; }
+
+  /* controls */
+  .ctl { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-top:10px; }
+  label.f { color:var(--muted); font-size:12px; }
+  input.t { width:56px; background:#0b0f14; color:var(--text); border:1px solid var(--line);
+            border-radius:6px; padding:5px 7px; font:inherit; font-size:13px; }
+  .seg { display:inline-flex; border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+  .seg button { background:none; border:none; color:var(--muted); font:inherit; font-weight:600;
+                font-size:13px; padding:6px 14px; cursor:pointer; border-left:1px solid var(--line); }
+  .seg button:first-child { border-left:none; }
+  .seg button.on.walk { background:rgba(88,166,255,.18); color:var(--blue); }
+  .seg button.on.jog  { background:rgba(63,185,80,.18);  color:var(--green); }
+  .seg button.on.run  { background:rgba(210,153,34,.18); color:var(--amber); }
+  button.act { background:var(--blue); color:#04121f; border:none; border-radius:8px;
+               font:inherit; font-weight:700; font-size:13px; padding:7px 16px; cursor:pointer; }
+  button.act:disabled { background:var(--line); color:var(--muted); cursor:default; }
+  button.ghost { background:none; border:1px solid var(--line); color:var(--muted);
+                 border-radius:8px; font:inherit; font-size:12px; padding:5px 10px; cursor:pointer; }
+  .status { font-size:12px; color:var(--muted); }
+  .status.ok { color:var(--green); } .status.err { color:var(--red); }
+
+  /* train result */
+  #trainBtn { background:var(--green); color:#04140a; font-size:15px; padding:10px 22px; }
+  table.rep { border-collapse:collapse; margin-top:10px; font-size:13px; }
+  table.rep th, table.rep td { border:1px solid var(--line); padding:5px 12px; text-align:right; }
+  table.rep th:first-child, table.rep td:first-child { text-align:left; }
+  .acc { font-size:26px; font-weight:700; }
+  .cm td { font-variant-numeric:tabular-nums; }
+  .cm .diag { color:var(--green); font-weight:700; }
+  .cm .off  { color:var(--red); }
+</style>
+</head>
+<body>
+  <div class="row" style="justify-content:space-between">
+    <div>
+      <h1>Label &amp; Train</h1>
+      <p class="sub">Add new recordings to the training library, auto-trimmed, then retrain — no terminal.</p>
+    </div>
+    <a href="/">← Sessions</a>
+  </div>
+
+  <div id="unavailable" class="panel hidden" style="color:var(--red)">
+    Labeler unavailable — this page only works when the dashboard runs locally on the Mac
+    (next to <code>data/library_api.py</code> and the training library).
+  </div>
+
+  <div id="main" class="hidden">
+    <!-- library summary + retrain -->
+    <div class="panel">
+      <div class="row" style="justify-content:space-between">
+        <div>
+          <div style="font-weight:600;margin-bottom:8px">Library <span id="libTotal" class="meta"></span></div>
+          <div id="lib" class="lib"></div>
+        </div>
+        <button id="trainBtn" class="act" onclick="train()">Retrain model</button>
+      </div>
+      <div id="trainOut"></div>
+    </div>
+
+    <div style="font-weight:600;margin:18px 0 8px">New recordings</div>
+    <div id="candNote" class="sub"></div>
+    <div id="cands"></div>
+  </div>
+
+<script>
+const $ = (s, r=document) => r.querySelector(s);
+let BUCKETS = ["walk","jog","run"];
+
+async function jget(u){ const r = await fetch(u); return r.json(); }
+async function jpost(u, body){
+  const r = await fetch(u, {method:"POST", headers:{"Content-Type":"application/json"},
+                           body:JSON.stringify(body)});
+  return {ok:r.ok, data: await r.json()};
+}
+
+function bars(intensity, t0, t1){
+  if(!intensity.length) return '<div class="meta">no motion data</div>';
+  const max = Math.max(...intensity, 1);
+  const cells = intensity.map((v,i)=>{
+    const h = Math.max(3, Math.round(v/max*48));
+    const keep = (i>=t0 && i<t1) ? " keep" : "";
+    return `<div class="bar${keep}" style="height:${h}px" title="${i}s: ${v}"></div>`;
+  }).join("");
+  return `<div class="bars">${cells}</div>`;
+}
+
+function card(s){
+  const t = s.trim;
+  const dis = s.already_added;
+  const segBtns = BUCKETS.map(b=>{
+    const on = (s.suggested_bucket===b) ? " on "+b : "";
+    return `<button class="${b}${on}" data-b="${b}" onclick="pick(${s.id},'${b}',this)">${b}</button>`;
+  }).join("");
+  return `
+  <div class="card${dis?' done':''}" id="card${s.id}" data-bucket="${s.suggested_bucket||''}">
+    <div class="row" style="justify-content:space-between">
+      <div><h3>#${s.id} · ${s.label ?? '<span class="meta">no label</span>'}</h3>
+           <div class="meta">${s.duration_s}s recorded${dis?' · already in library':''}</div></div>
+    </div>
+    <div id="barwrap${s.id}">${bars(s.intensity, t.t0, t.t1)}</div>
+    <div class="axis"><span>0s</span><span>keep = amber</span><span>${s.duration_s}s</span></div>
+    <div class="ctl ${dis?'hidden':''}">
+      <label class="f">trim</label>
+      <input class="t" id="t0_${s.id}" type="number" min="0" value="${t.t0}"
+             oninput="rebar(${s.id})">
+      <span class="meta">→</span>
+      <input class="t" id="t1_${s.id}" type="number" min="0" value="${t.t1}"
+             oninput="rebar(${s.id})">
+      <span class="meta">s</span>
+      <span class="seg">${segBtns}</span>
+      <button class="act" id="add${s.id}" onclick="add(${s.id})">Add to library</button>
+      <span class="status" id="st${s.id}"></span>
+    </div>
+    ${dis?'<div class="status">Already added — retrain to include it, or remove it from the Library above.</div>':''}
+  </div>`;
+}
+
+const cache = {};       // id -> session (for intensity redraw)
+function rebar(id){
+  const s = cache[id];
+  const t0 = +$("#t0_"+id).value, t1 = +$("#t1_"+id).value;
+  $("#barwrap"+id).innerHTML = bars(s.intensity, t0, t1);
+}
+function pick(id, b, el){
+  $("#card"+id).dataset.bucket = b;
+  el.parentElement.querySelectorAll("button").forEach(x=>{
+    x.className = x.dataset.b + (x.dataset.b===b ? " on "+b : "");
+  });
+}
+async function add(id){
+  const bucket = $("#card"+id).dataset.bucket;
+  const st = $("#st"+id);
+  if(!bucket){ st.className="status err"; st.textContent="pick a label first"; return; }
+  const t0 = +$("#t0_"+id).value, t1 = +$("#t1_"+id).value;
+  $("#add"+id).disabled = true; st.className="status"; st.textContent="adding…";
+  const {ok, data} = await jpost("/api/label/add", {id, bucket, t0, t1});
+  if(ok){ st.className="status ok"; st.textContent=`✓ added ${data.kept_seconds}s as ${data.bucket}`;
+          $("#card"+id).classList.add("done"); await loadLib(); }
+  else  { st.className="status err"; st.textContent=data.error||"failed"; $("#add"+id).disabled=false; }
+}
+
+async function loadLib(){
+  const lib = await jget("/api/label/library");
+  $("#libTotal").textContent = `· ${lib.total} sessions`;
+  $("#lib").innerHTML = BUCKETS.map(b=>{
+    const items = lib.buckets[b]||[];
+    const secs = items.reduce((a,x)=>a+x.duration_s,0);
+    const dels = items.map(x=>`<button class="ghost" title="remove #${x.id}"
+                    onclick="remove(${x.id})">#${x.id} ✕</button>`).join(" ");
+    return `<span class="chip ${b}"><b>${b}</b> ${items.length} · ${secs}s ${dels}</span>`;
+  }).join("");
+}
+async function remove(id){
+  const {ok} = await jpost("/api/label/remove", {id});
+  if(ok){ await loadLib(); await loadCands(); }
+}
+
+async function loadCands(){
+  const c = await jget("/api/label/candidates");
+  if(c.error){ $("#candNote").textContent = c.error; return; }
+  BUCKETS = c.buckets;
+  const fresh = c.sessions.filter(s=>!s.already_added);
+  $("#candNote").textContent = `${fresh.length} new · ${c.sessions.length} total in the latest dump`;
+  c.sessions.forEach(s=>cache[s.id]=s);
+  $("#cands").innerHTML = c.sessions.map(card).join("");
+}
+
+function pct(x){ return x==null ? "—" : (x*100).toFixed(0)+"%"; }
+async function train(){
+  const btn = $("#trainBtn"); btn.disabled=true; const old=btn.textContent; btn.textContent="Training…";
+  const {ok, data} = await jpost("/api/label/train", {});
+  btn.disabled=false; btn.textContent=old;
+  const out = $("#trainOut");
+  if(!ok){ out.innerHTML = `<div class="status err" style="margin-top:10px">${data.error}</div>`; return; }
+  let html = "";
+  if(data.scored){
+    html += `<div class="row" style="gap:16px;margin-top:14px;align-items:baseline">
+               <span class="acc">${pct(data.accuracy)}</span>
+               <span class="meta">honest accuracy — each session guessed while held out</span></div>`;
+    html += `<table class="rep"><tr><th>class</th><th>precision</th><th>recall</th><th>f1</th><th>n</th></tr>`;
+    for(const b of data.buckets){
+      const m = data.per_class[b]||{};
+      html += `<tr><td>${b}</td><td>${pct(m.precision)}</td><td>${pct(m.recall)}</td>
+               <td>${pct(m.f1)}</td><td>${m.support??"—"}</td></tr>`;
+    }
+    html += `</table>`;
+    const L = data.confusion.labels, M = data.confusion.matrix;
+    html += `<div class="meta" style="margin-top:12px">Confusion — rows = actual, cols = guessed</div>`;
+    html += `<table class="rep cm"><tr><th></th>${L.map(l=>`<th>${l}</th>`).join("")}</tr>`;
+    M.forEach((r,i)=>{ html += `<tr><td>${L[i]}</td>` +
+      r.map((v,j)=>`<td class="${i===j?'diag':(v?'off':'')}">${v}</td>`).join("") + `</tr>`; });
+    html += `</table>`;
+  } else {
+    html += `<div class="status" style="margin-top:10px">${data.note||"trained"}</div>`;
+  }
+  if(data.empty && data.empty.length)
+    html += `<div class="status" style="margin-top:8px">Empty buckets: ${data.empty.join(", ")} — record some.</div>`;
+  out.innerHTML = html;
+}
+
+(async function init(){
+  const avail = {{ 'true' if available else 'false' }};
+  if(!avail){ $("#unavailable").classList.remove("hidden"); return; }
+  $("#main").classList.remove("hidden");
+  await loadLib();
+  await loadCands();
+})();
+</script>
+</body>
+</html>
