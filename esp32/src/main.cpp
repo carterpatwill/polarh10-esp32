@@ -1,10 +1,29 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// BLE-only local-logging firmware for the Seeed XIAO ESP32-S3 + Polar H10.
+//
+// Two modes, chosen automatically:
+//
+//   RECORD (default, on battery)
+//     WiFi is OFF. The board scans for the Polar strap, connects, and the moment
+//     it connects a session begins: HR + ACC (25 Hz) are written to onboard
+//     flash (LittleFS) as CSV. A brief strap dropout resumes the same session;
+//     a long gap finalizes it and the next connect starts a new one.
+//       LED: solid = recording, slow blink = scanning, triple-blink = flash full.
+//
+//   SYNC (when plugged into USB)
+//     Recording pauses, WiFi comes up, and a tiny web server serves the stored
+//     session files so you can download them, then delete/wipe. The board prints
+//     its URL to the serial monitor (USB is connected, so you'll see it).
+//       LED: fast blink.
+//
+// No MQTT, no control page, no cloud — everything lives on the device until you
+// offload it over USB.
+// ─────────────────────────────────────────────────────────────────────────────
 #include <Arduino.h>
-#include <WiFi.h>
-#include <WiFiClientSecure.h>
-#include <esp_eap_client.h>
-#include <PubSubClient.h>
 #include <NimBLEDevice.h>
-#include <ArduinoJson.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <LittleFS.h>
 #include "config.h"
 
 static const char* HR_SVC_UUID  = "0000180D-0000-1000-8000-00805f9b34fb";
@@ -40,129 +59,157 @@ struct ACCSample {
     int16_t  x, y, z; // milli-g
 };
 
-static WiFiClientSecure secureClient;
-static PubSubClient      mqtt(secureClient);
-static QueueHandle_t     hrQueue;
-static QueueHandle_t     accQueue;
+static QueueHandle_t  hrQueue;
+static QueueHandle_t  accQueue;
 static volatile bool  doConnect = false;
 static NimBLEAddress  polarAddr;
 static NimBLEClient*  pClient   = nullptr;
-static bool           connected = false;
+static volatile bool  connected = false;
+static volatile bool  accStreaming = false;
 
-// Live state exposed to the web server
-static volatile uint8_t  lastBPM         = 0;
-static volatile uint32_t lastBPMTime_ms  = 0;
-static bool              receiverOk      = false;
-static uint32_t          lastPostTime_ms = 0;
-
-// Live accelerometer state
-static volatile bool     accStreaming    = false;
-static volatile int16_t  lastAccX        = 0;
-static volatile int16_t  lastAccY        = 0;
-static volatile int16_t  lastAccZ        = 0;
-static volatile uint32_t lastAccTime_ms  = 0;
-
-// Session state (gate + mark). Idle by default; data is only buffered/published
-// while a session is active. The Pi owns the session identity/timestamps.
-static volatile bool     sessionActive   = false;
-static uint32_t          sessionStart_ms = 0;
-static char              sessionLabel[64] = "";   // user-supplied label for the current session
-
-// PMD control-point handle, kept live so session start/stop can (re)start or stop
-// the Polar accelerometer stream without reconnecting.
+// PMD control-point handle, kept live so a resumed session can restart the ACC
+// stream without reconnecting.
 static NimBLERemoteCharacteristic* pmdCtrlChr = nullptr;
+
+// ── Session state ─────────────────────────────────────────────────────────────
+// A session opens on the first strap connect and stays open across brief
+// dropouts. Data timestamps are milliseconds relative to session start; there is
+// no real-world clock on the board (sessions are sequentially numbered instead).
+static bool      sessionActive   = false;   // a session file is currently open
+static uint16_t  sessionNum      = 0;       // sequential id of the open session
+static uint32_t  sessionStart_ms = 0;       // millis() at session open
+static uint32_t  disconnectedAt  = 0;       // millis() of last strap drop (0 = connected)
+static File      hrFile;
+static File      accFile;
+static bool      flashFull       = false;   // stopped writing: LittleFS below margin
+
+// ── Operating mode ────────────────────────────────────────────────────────────
+enum Mode { MODE_RECORD, MODE_SYNC };
+static Mode      mode = MODE_RECORD;
+static WebServer server(80);
 
 // ── Battery ───────────────────────────────────────────────────────────────────
 static int readBatteryPercent() {
-    if (PIN_BAT_ADC < 0) return -1;                      // no battery divider wired
+    if (PIN_BAT_ADC < 0) return -1;                       // no battery divider wired
     uint32_t mv = analogReadMilliVolts(PIN_BAT_ADC) * 2;  // 1:2 divider
     if (mv <= 3000) return 0;
     if (mv >= 4200) return 100;
     return (int)((mv - 3000) * 100 / 1200);
 }
 
-// ── Publish the ESP32's live status snapshot to MQTT ──────────────────────────
-// The control page (browser over MQTT-over-WebSocket) subscribes to MQTT_TOPIC_ESP
-// and renders all of this. The ESP no longer serves any HTTP itself.
-static void publishEspStatus() {
-    if (!mqtt.connected()) return;
-    JsonDocument doc;
-    doc["ble_connected"]  = connected;
-    doc["bpm"]            = (int)lastBPM;
-    doc["bpm_age_ms"]     = connected ? (int32_t)(millis() - lastBPMTime_ms) : -1;
-    doc["receiver_ok"]    = receiverOk;                 // ESP↔broker link healthy
-    doc["last_post_ms"]   = receiverOk ? (int32_t)(millis() - lastPostTime_ms) : -1;
-    doc["broker"]         = MQTT_HOST;
-    doc["lan_ip"]         = WiFi.localIP().toString();
-    doc["wifi_ssid"]      = WiFi.SSID();          // which network the ESP joined
-    doc["wifi_rssi"]      = (int)WiFi.RSSI();      // signal strength (dBm)
-    doc["battery_pct"]    = readBatteryPercent();
-    doc["acc_streaming"]  = accStreaming;
-    doc["acc_x"]          = (int)lastAccX;
-    doc["acc_y"]          = (int)lastAccY;
-    doc["acc_z"]          = (int)lastAccZ;
-    doc["acc_age_ms"]     = accStreaming ? (int32_t)(millis() - lastAccTime_ms) : -1;
-    doc["session_active"] = sessionActive;
-    doc["session_ms"]     = sessionActive ? (int32_t)(millis() - sessionStart_ms) : 0;
-    doc["session_label"]  = sessionLabel;   // echo the label back so the page can confirm it
-    doc["uptime_ms"]      = (uint32_t)millis();
+// ─────────────────────────────────────────────────────────────────────────────
+// Session files on LittleFS
+//
+// Each session is two CSVs:   /s0001_hr.csv   and   /s0001_acc.csv
+//   hr:  t_ms,bpm,rr_ms        (rr_ms is ';'-joined, may be empty)
+//   acc: t_ms,x,y,z            (milli-g)
+// t_ms is milliseconds since the session opened.
+// ─────────────────────────────────────────────────────────────────────────────
 
-    String out;
-    serializeJson(doc, out);
-    mqtt.publish(MQTT_TOPIC_ESP, out.c_str());
-}
-
-// Mark the Pi session (gate + start/stop the Polar ACC stream) for the receiver.
-static void publishSession(const char* action) {
-    if (!mqtt.connected()) return;
-    JsonDocument d;
-    d["action"] = action;
-    d["t_ms"]   = millis();
-    if (strcmp(action, "start") == 0 && sessionLabel[0]) d["label"] = sessionLabel;
-    String s;
-    serializeJson(d, s);
-    mqtt.publish(MQTT_TOPIC_SESSION, s.c_str());
-}
-
-static void flashOnBL(int times);   // defined below; blinks the status LED quickly
-
-// Apply a start/stop command (received over MQTT_TOPIC_CMD from the control page).
-static void applySession(const char* action, const char* label) {
-    if (strcmp(action, "start") == 0) {
-        // Capture the label for this session (empty string if none was supplied).
-        strncpy(sessionLabel, label ? label : "", sizeof(sessionLabel) - 1);
-        sessionLabel[sizeof(sessionLabel) - 1] = '\0';
-        sessionActive   = true;
-        sessionStart_ms = millis();
-        if (pmdCtrlChr) pmdCtrlChr->writeValue(PMD_START_ACC, sizeof(PMD_START_ACC), true);
-        publishSession("start");    // tell the Pi receiver to open a session (with label)
-        publishEspStatus();         // reflect the new state to the control page immediately
-        flashOnBL(2);               // two quick flashes = session started
-        digitalWrite(PIN_STATUS_LED, connected ? LOW : HIGH);  // back to steady state
-        Serial.printf("[Session] START (via MQTT) label='%s'\n", sessionLabel);
-    } else if (strcmp(action, "stop") == 0) {
-        sessionActive = false;
-        if (pmdCtrlChr) pmdCtrlChr->writeValue(PMD_STOP_ACC, sizeof(PMD_STOP_ACC), true);
-        accStreaming  = false;
-        publishSession("stop");
-        sessionLabel[0] = '\0';     // clear once the session is closed
-        publishEspStatus();
-        flashOnBL(1);               // one quick flash = session stopped
-        digitalWrite(PIN_STATUS_LED, connected ? LOW : HIGH);  // back to steady state
-        Serial.println("[Session] STOP (via MQTT)");
-    } else {
-        Serial.printf("[Session] Unknown command action: '%s'\n", action);
+// Scan the filesystem for the highest existing session number so a new session
+// never reuses an id (until you wipe, which resets numbering to 1).
+static uint16_t nextSessionNumber() {
+    uint16_t maxNum = 0;
+    File root = LittleFS.open("/");
+    for (File f = root.openNextFile(); f; f = root.openNextFile()) {
+        // Names look like "/s0001_hr.csv"; getName() may or may not include '/'.
+        const char* n = f.name();
+        const char* p = strrchr(n, '/');
+        if (p) n = p + 1;
+        if (n[0] == 's') {
+            uint16_t num = (uint16_t)atoi(n + 1);
+            if (num > maxNum) maxNum = num;
+        }
     }
+    return maxNum + 1;
 }
 
-// ── MQTT inbound: session start/stop commands from the control page ───────────
-static void onMqtt(char* topic, uint8_t* payload, unsigned int len) {
-    JsonDocument doc;
-    if (deserializeJson(doc, payload, len)) return;
-    if (strcmp(topic, MQTT_TOPIC_CMD) == 0) {
-        const char* action = doc["action"] | "";
-        const char* label  = doc["label"]  | "";
-        applySession(action, label);
+static bool flashHasRoom() {
+    return (LittleFS.totalBytes() - LittleFS.usedBytes()) > FLASH_MIN_FREE;
+}
+
+// Open a fresh session (new sequential id + two CSV files with headers).
+static void openSession() {
+    if (!flashHasRoom()) {
+        flashFull = true;
+        Serial.println("[REC] Flash full — not starting a session");
+        return;
+    }
+    sessionNum = nextSessionNumber();
+    char path[24];
+    snprintf(path, sizeof(path), "/s%04u_hr.csv", sessionNum);
+    hrFile = LittleFS.open(path, FILE_WRITE);
+    snprintf(path, sizeof(path), "/s%04u_acc.csv", sessionNum);
+    accFile = LittleFS.open(path, FILE_WRITE);
+    if (!hrFile || !accFile) {
+        Serial.println("[REC] Failed to open session files");
+        if (hrFile)  hrFile.close();
+        if (accFile) accFile.close();
+        return;
+    }
+    hrFile.println("t_ms,bpm,rr_ms");
+    accFile.printf("# sample_rate_hz=%d range_g=%d\n", ACC_SAMPLE_RATE, ACC_RANGE_G);
+    accFile.println("t_ms,x,y,z");
+    hrFile.flush();
+    accFile.flush();
+    sessionActive   = true;
+    sessionStart_ms = millis();
+    flashFull       = false;
+    Serial.printf("[REC] Session %04u opened\n", sessionNum);
+}
+
+// Finalize the open session (flush + close both files).
+static void closeSession() {
+    if (!sessionActive) return;
+    if (hrFile)  { hrFile.flush();  hrFile.close();  }
+    if (accFile) { accFile.flush(); accFile.close(); }
+    Serial.printf("[REC] Session %04u closed\n", sessionNum);
+    sessionActive = false;
+}
+
+// Drain the HR queue into the open session file.
+static void flushHR() {
+    if (!sessionActive || !hrFile) return;
+    HRReading r;
+    int count = 0;
+    while (xQueueReceive(hrQueue, &r, 0) == pdTRUE) {
+        hrFile.printf("%lu,%u,", (unsigned long)(r.t_ms - sessionStart_ms), r.bpm);
+        for (int i = 0; i < r.rr_count; i++) {
+            if (i) hrFile.print(';');
+            hrFile.print(r.rr_ms[i], 1);
+        }
+        hrFile.print('\n');
+        count++;
+    }
+    if (count) hrFile.flush();
+}
+
+// Drain the ACC queue into the open session file.
+static void flushACC() {
+    if (!sessionActive || !accFile) return;
+    ACCSample s;
+    int count = 0;
+    while (xQueueReceive(accQueue, &s, 0) == pdTRUE) {
+        accFile.printf("%lu,%d,%d,%d\n",
+                       (unsigned long)(s.t_ms - sessionStart_ms), s.x, s.y, s.z);
+        count++;
+    }
+    if (count) accFile.flush();
+}
+
+// Flush both queues if it's time, and enforce the flash-full guard. Called from
+// the record loop; if we run out of room we close the session and latch the
+// "full" LED state until data is offloaded.
+static void serviceRecording() {
+    static uint32_t lastHR = 0, lastACC = 0;
+    uint32_t now = millis();
+    if (now - lastHR >= BATCH_MS)  { lastHR = now;  flushHR();  }
+    if (now - lastACC >= ACC_BATCH_MS) { lastACC = now; flushACC(); }
+
+    if (sessionActive && !flashHasRoom()) {
+        Serial.println("[REC] Flash full — stopping recording");
+        closeSession();
+        flashFull = true;
     }
 }
 
@@ -193,10 +240,6 @@ static void onHRNotify(NimBLERemoteCharacteristic*, uint8_t* data, size_t len, b
         }
     }
 
-    lastBPM        = r.bpm;
-    lastBPMTime_ms = r.t_ms;
-
-    // Always show the live value; only buffer for upload during an active session.
     if (sessionActive) xQueueSend(hrQueue, &r, 0);
     Serial.printf("[HR] %d BPM\n", r.bpm);
 }
@@ -215,8 +258,7 @@ static int32_t readSignedBits(const uint8_t* data, size_t bitPos, uint8_t bits) 
 
 static inline void emitAccSample(int32_t x, int32_t y, int32_t z, uint32_t t_ms) {
     ACCSample s{ t_ms, (int16_t)x, (int16_t)y, (int16_t)z };
-    lastAccX = s.x; lastAccY = s.y; lastAccZ = s.z; lastAccTime_ms = t_ms;
-    xQueueSend(accQueue, &s, 0);
+    if (sessionActive) xQueueSend(accQueue, &s, 0);
 }
 
 // ── ACC notification callback (PMD data char, delta-compressed frames) ───────
@@ -270,46 +312,40 @@ static void onPmdControl(NimBLERemoteCharacteristic*, uint8_t* data, size_t len,
 }
 
 // ── Status LED ────────────────────────────────────────────────────────────────
-// On the XIAO ESP32-S3 this is the onboard user LED (GPIO21, active-low): it
-// blinks while connecting/scanning and lights solid once a Polar strap connects.
+// GPIO21, active-low (LOW = lit). See config.h for the state legend.
 static constexpr int PIN_BL = PIN_STATUS_LED;
 
-// Status-LED states convey how close to "fully online" the board is (see
-// updateStatusLed, which is the single source of truth now):
-//   fast blink  → looking for WiFi (uplink down)
-//   slow blink  → WiFi up, but the strap or the MQTT broker isn't connected
-//   solid on    → fully online: WiFi + broker + strap all connected
-static constexpr uint32_t WIFI_BLINK_MS = 120;   // fast
-static constexpr uint32_t BLE_BLINK_MS  = 700;   // slow
-// How long to let the SDK's auto-reconnect try before re-walking the network list.
-static constexpr uint32_t WIFI_RECONNECT_MS = 10000;
+static inline void ledOn()  { digitalWrite(PIN_BL, LOW);  }
+static inline void ledOff() { digitalWrite(PIN_BL, HIGH); }
 
-static void flashOnBL(int times = 3) {
-    for (int i = 0; i < times; i++) {
-        digitalWrite(PIN_BL, LOW);  delay(80);
-        digitalWrite(PIN_BL, HIGH); delay(80);
-    }
-    digitalWrite(PIN_BL, HIGH);
-}
+// Drive the LED to reflect the current state. Non-blocking; called every loop.
+//   solid            → recording (strap connected)
+//   slow blink       → scanning / no strap
+//   fast blink       → sync mode
+//   rapid triple     → flash full, recording stopped
+static void updateStatusLed() {
+    static uint32_t lastTick = 0;
+    static uint8_t  phase    = 0;
+    uint32_t now = millis();
 
-// Block until WiFi connects, blinking the LED at `period_ms`. Gives up after
-// `timeout_ms` (returns false); a timeout_ms of 0 waits forever. Replaces the
-// old fixed 500 ms delay loops so the "searching for WiFi" blink can run fast
-// without shortening how long we actually wait for each network.
-static bool waitForWiFi(uint32_t timeout_ms, uint32_t period_ms) {
-    uint32_t start = millis(), lastToggle = 0;
-    bool bl = false;
-    while (WiFi.status() != WL_CONNECTED) {
-        if (timeout_ms && millis() - start >= timeout_ms) return false;
-        if (millis() - lastToggle >= period_ms) {
-            lastToggle = millis();
-            bl = !bl;
-            digitalWrite(PIN_BL, bl ? HIGH : LOW);
-            Serial.print(".");
+    if (flashFull && mode == MODE_RECORD) {
+        // Three quick blinks, then a pause: pattern repeats every ~1.2 s.
+        if (now - lastTick >= 120) {
+            lastTick = now;
+            phase = (phase + 1) % 10;               // 6 blink-halves + 4 pause slots
+            digitalWrite(PIN_BL, (phase < 6 && (phase % 2 == 0)) ? LOW : HIGH);
         }
-        delay(10);
+        return;
     }
-    return true;
+
+    if (mode == MODE_RECORD && connected) { ledOn(); return; }  // solid
+
+    uint32_t period = (mode == MODE_SYNC) ? 150 : 700;         // fast vs slow blink
+    if (now - lastTick >= period) {
+        lastTick = now;
+        phase ^= 1;
+        digitalWrite(PIN_BL, phase ? LOW : HIGH);
+    }
 }
 
 // ── BLE scan: match any Polar device ─────────────────────────────────────────
@@ -324,18 +360,19 @@ class ScanCB : public NimBLEScanCallbacks {
     }
 };
 
-// ── BLE client: auto-rescan on disconnect ─────────────────────────────────────
+// ── BLE client: mark disconnect time so the loop can resume-or-finalize ───────
 class ClientCB : public NimBLEClientCallbacks {
     void onDisconnect(NimBLEClient*, int reason) override {
-        connected    = false;
-        accStreaming = false;
-        pClient      = nullptr;
-        pmdCtrlChr   = nullptr;
+        connected      = false;
+        accStreaming   = false;
+        pClient        = nullptr;
+        pmdCtrlChr     = nullptr;
+        disconnectedAt = millis();
         Serial.printf("[BLE] Disconnected (%d), will rescan\n", reason);
     }
 };
 
-// ── Connect to Polar and subscribe to HR ─────────────────────────────────────
+// ── Connect to Polar, subscribe to HR + ACC, open/resume the session ─────────
 static bool connectToPolar() {
     pClient = NimBLEDevice::createClient();
     pClient->setClientCallbacks(new ClientCB(), false);
@@ -369,6 +406,12 @@ static bool connectToPolar() {
     connected = true;
     Serial.println("[BLE] Subscribed to HR notifications");
 
+    // A session begins on connect. If we dropped only briefly (within the resume
+    // window) the existing session is still open, so keep writing to it; otherwise
+    // open a fresh one.
+    if (!sessionActive && !flashFull) openSession();
+    disconnectedAt = 0;
+
     // ── Start the PMD accelerometer stream (best-effort; HR still works if absent)
     accStreaming = false;
     auto* pmd = pClient->getService(PMD_SVC_UUID);
@@ -378,8 +421,7 @@ static bool connectToPolar() {
         if (dataChr && ctrlChr && dataChr->canNotify()) {
             dataChr->subscribe(true, onAccNotify);         // notifications for the sample stream
             ctrlChr->subscribe(false, onPmdControl);       // indications for the command response
-            pmdCtrlChr = ctrlChr;                          // kept for session start/stop
-            // Only stream while a session is active (covers reconnect mid-session).
+            pmdCtrlChr = ctrlChr;
             if (sessionActive) {
                 if (ctrlChr->writeValue(PMD_START_ACC, sizeof(PMD_START_ACC), true)) {
                     Serial.printf("[ACC] Requested ACC stream @ %d Hz, ±%d g\n",
@@ -387,8 +429,6 @@ static bool connectToPolar() {
                 } else {
                     Serial.println("[ACC] Failed to write PMD start command");
                 }
-            } else {
-                Serial.println("[ACC] Idle (no session) — ACC stream not started");
             }
         } else {
             Serial.println("[ACC] PMD characteristics not found");
@@ -397,210 +437,166 @@ static bool connectToPolar() {
         Serial.println("[ACC] PMD service not found (device may not support ACC)");
     }
 
-    digitalWrite(PIN_BL, LOW);
     return true;
 }
 
-// ── (Re)connect to HiveMQ Cloud over TLS ──────────────────────────────────────
-static bool mqttConnect() {
-    if (mqtt.connected()) return true;
-    if (WiFi.status() != WL_CONNECTED) return false;
-
-    Serial.print("[MQTT] Connecting to "); Serial.print(MQTT_HOST); Serial.print("...");
-    if (mqtt.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASS)) {
-        Serial.println(" connected");
-        receiverOk = true;
-        mqtt.subscribe(MQTT_TOPIC_CMD);   // receive start/stop commands from the control page
-        publishEspStatus();               // announce ourselves right after (re)connecting
-        return true;
-    }
-    Serial.printf(" failed, rc=%d\n", mqtt.state());
-    receiverOk = false;
-    return false;
-}
-
-// ── Drain queue and publish JSON batch to HiveMQ ──────────────────────────────
-static void sendBatch() {
-    if (!mqttConnect()) return;
-
-    HRReading r;
-    JsonDocument doc;
-    JsonArray arr = doc["readings"].to<JsonArray>();
-    int count = 0;
-
-    while (xQueueReceive(hrQueue, &r, 0) == pdTRUE) {
-        JsonObject obj = arr.add<JsonObject>();
-        obj["t_ms"] = r.t_ms;
-        obj["bpm"]  = r.bpm;
-        if (r.rr_count > 0) {
-            JsonArray rr = obj["rr_ms"].to<JsonArray>();
-            for (int i = 0; i < r.rr_count; i++) rr.add(r.rr_ms[i]);
-        }
-        count++;
-    }
-
-    if (count == 0) return;
-
-    String body;
-    serializeJson(doc, body);
-
-    if (mqtt.publish(MQTT_TOPIC, body.c_str())) {
-        receiverOk      = true;
-        lastPostTime_ms = millis();
-        Serial.printf("[MQTT] Published %d readings (%d bytes) → %s\n", count, body.length(), MQTT_TOPIC);
-    } else {
-        receiverOk = false;
-        Serial.printf("[MQTT] Publish failed (buffer too small? state=%d)\n", mqtt.state());
-    }
-}
-
-// ── Drain ACC queue and publish JSON batch (all 3 axes) to HiveMQ ─────────────
-static void sendAccBatch() {
-    if (uxQueueMessagesWaiting(accQueue) == 0) return;
-    if (!mqttConnect()) return;
-
-    ACCSample s;
-    JsonDocument doc;
-    doc["sample_rate_hz"] = ACC_SAMPLE_RATE;
-    doc["range_g"]        = ACC_RANGE_G;
-    JsonArray arr = doc["samples"].to<JsonArray>();
-    int count = 0;
-
-    while (xQueueReceive(accQueue, &s, 0) == pdTRUE) {
-        JsonArray xyz = arr.add<JsonArray>();   // compact [t_ms, x, y, z]
-        xyz.add(s.t_ms);
-        xyz.add(s.x);
-        xyz.add(s.y);
-        xyz.add(s.z);
-        count++;
-    }
-
-    if (count == 0) return;
-
-    String body;
-    serializeJson(doc, body);
-
-    if (mqtt.publish(MQTT_TOPIC_ACC, body.c_str())) {
-        lastPostTime_ms = millis();
-        Serial.printf("[MQTT] Published %d ACC samples (%d bytes) → %s\n", count, body.length(), MQTT_TOPIC_ACC);
-    } else {
-        Serial.printf("[MQTT] ACC publish failed (buffer too small? state=%d)\n", mqtt.state());
-    }
-}
-
-// ── Join WiFi: walk the network list, blocking until one connects ─────────────
-// Called once at boot and again from the loop whenever the link drops. The last
-// network waits forever, so this always returns with WiFi up.
-static void connectWiFi() {
-    WiFi.mode(WIFI_STA);
-    WiFi.persistent(false);       // don't wear out flash rewriting creds every boot
-    WiFi.setSleep(false);         // no modem sleep — flaky hotspots drop dozing clients
-    WiFi.setAutoReconnect(true);  // let the SDK rejoin the last AP on brief blips
-
-    // Try the phone hotspot first (10 s) — it's the network you carry when out
-    // recording. Fast blink while searching.
-    Serial.print("[WiFi] Trying phone hotspot");
-    WiFi.begin(HOME3_SSID, HOME3_PASS);
-    waitForWiFi(10000, WIFI_BLINK_MS);
-
-    // Then eduroam (10 s) — enterprise WPA2-EAP.
-    if (WiFi.status() != WL_CONNECTED) {
-        Serial.print("\n[WiFi] Trying eduroam");
-        WiFi.disconnect(true);
-        delay(500);
-        WiFi.mode(WIFI_STA);
-        esp_eap_client_set_identity((uint8_t*)ENT_IDENTITY, strlen(ENT_IDENTITY));
-        esp_eap_client_set_username((uint8_t*)ENT_USER,     strlen(ENT_USER));
-        esp_eap_client_set_password((uint8_t*)ENT_PASS,     strlen(ENT_PASS));
-        esp_wifi_sta_enterprise_enable();
-        WiFi.begin(ENT_SSID);
-        waitForWiFi(10000, WIFI_BLINK_MS);
-    }
-
-    // Then the personal network (10 s). Tear down enterprise mode first so the
-    // normal WPA2-PSK join isn't confused by leftover EAP config.
-    if (WiFi.status() != WL_CONNECTED) {
-        Serial.print("\n[WiFi] Trying personal network");
-        esp_wifi_sta_enterprise_disable();
-        WiFi.disconnect(true);
-        delay(500);
-        WiFi.mode(WIFI_STA);
-        WiFi.begin(HOME_SSID, HOME_PASS);
-        waitForWiFi(10000, WIFI_BLINK_MS);
-    }
-
-    // Last resort: the second personal network — wait indefinitely.
-    if (WiFi.status() != WL_CONNECTED) {
-        Serial.print("\n[WiFi] Trying Gold Coast");
-        WiFi.disconnect(true);
-        delay(500);
-        WiFi.mode(WIFI_STA);
-        WiFi.begin(HOME2_SSID, HOME2_PASS);
-        waitForWiFi(0, WIFI_BLINK_MS);   // no network left to fall back to — wait indefinitely
-    }
-
-    Serial.printf("\n[WiFi] Connected to '%s' (%d dBm), IP: %s\n",
-                  WiFi.SSID().c_str(), (int)WiFi.RSSI(),
-                  WiFi.localIP().toString().c_str());
-}
-
-// ── Keep WiFi alive: give the SDK a moment, then re-run the full join ─────────
-// setAutoReconnect handles brief blips silently. If the link is still down after
-// WIFI_RECONNECT_MS (e.g. the hotspot vanished), re-walk the list so we can fall
-// over to another network, then bring the broker back up.
-static uint32_t wifiDownSince = 0;
-static void ensureWiFi() {
-    if (WiFi.status() == WL_CONNECTED) { wifiDownSince = 0; return; }
-
-    uint32_t now = millis();
-    if (wifiDownSince == 0) {
-        wifiDownSince = now;
-        Serial.println("[WiFi] Link down — waiting for auto-reconnect");
-    }
-    if (now - wifiDownSince >= WIFI_RECONNECT_MS) {
-        Serial.println("[WiFi] Still down — re-running full connect sequence");
-        connectWiFi();     // blocks until some network joins
-        wifiDownSince = 0;
-        mqttConnect();     // follow WiFi back up so the control page sees us again
+// If the strap has been gone longer than the resume window, finalize the session
+// so the next connect starts a new file. Brief dropouts keep the file open.
+static void serviceSessionLifecycle() {
+    if (sessionActive && !connected && disconnectedAt &&
+        millis() - disconnectedAt >= SESSION_RESUME_MS) {
+        Serial.println("[REC] Resume window elapsed — finalizing session");
+        closeSession();
+        disconnectedAt = 0;
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Sync mode: bring WiFi up and serve the recordings over a tiny web page.
+// ─────────────────────────────────────────────────────────────────────────────
+static String humanSize(size_t b) {
+    char buf[24];
+    if (b < 1024)              snprintf(buf, sizeof(buf), "%u B", (unsigned)b);
+    else if (b < 1024 * 1024)  snprintf(buf, sizeof(buf), "%.1f KB", b / 1024.0);
+    else                       snprintf(buf, sizeof(buf), "%.2f MB", b / (1024.0 * 1024.0));
+    return String(buf);
+}
+
+static void handleIndex() {
+    size_t total = LittleFS.totalBytes(), used = LittleFS.usedBytes();
+    String html = F("<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
+                    "<title>Polar recordings</title>"
+                    "<style>body{font:15px system-ui;margin:2rem;max-width:640px}"
+                    "a{color:#06c}li{margin:.3rem 0}code{color:#555}</style>"
+                    "<h2>Polar recordings</h2>");
+    html += "<p><code>" + humanSize(used) + " used of " + humanSize(total) + "</code></p><ul>";
+    File root = LittleFS.open("/");
+    bool any = false;
+    for (File f = root.openNextFile(); f; f = root.openNextFile()) {
+        String name = f.name();
+        if (name.startsWith("/")) name = name.substring(1);
+        if (!name.startsWith("s")) continue;
+        any = true;
+        html += "<li><a href='/dl?f=" + name + "'>" + name + "</a> "
+                "<code>" + humanSize(f.size()) + "</code></li>";
+    }
+    if (!any) html += "<li><i>(no recordings)</i></li>";
+    html += "</ul><p><a href='/wipe' onclick=\"return confirm('Delete ALL recordings?')\">"
+            "Wipe all recordings</a></p>";
+    server.send(200, "text/html", html);
+}
+
+static void handleDownload() {
+    String f = server.arg("f");
+    if (f.indexOf('/') >= 0 || !f.startsWith("s")) { server.send(400, "text/plain", "bad name"); return; }
+    String path = "/" + f;
+    File file = LittleFS.open(path, FILE_READ);
+    if (!file) { server.send(404, "text/plain", "not found"); return; }
+    server.sendHeader("Content-Disposition", "attachment; filename=" + f);
+    server.streamFile(file, "text/csv");
+    file.close();
+}
+
+static void handleWipe() {
+    File root = LittleFS.open("/");
+    String victims[64];
+    int n = 0;
+    for (File f = root.openNextFile(); f && n < 64; f = root.openNextFile()) {
+        String name = f.name();
+        if (!name.startsWith("/")) name = "/" + name;
+        if (name.startsWith("/s")) victims[n++] = name;
+    }
+    for (int i = 0; i < n; i++) LittleFS.remove(victims[i]);
+    Serial.printf("[SYNC] Wiped %d files\n", n);
+    server.sendHeader("Location", "/");
+    server.send(303);
+}
+
+static void enterSyncMode() {
+    Serial.println("\n[SYNC] USB detected — entering sync mode");
+    // Stop recording: close any open session and drop the strap so BLE is idle.
+    closeSession();
+    NimBLEDevice::getScan()->stop();
+    if (pClient) { pClient->disconnect(); pClient = nullptr; }
+    connected = false;
+
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);
+    Serial.printf("[SYNC] Joining WiFi '%s'", SYNC_SSID);
+    WiFi.begin(SYNC_SSID, SYNC_PASS);
+    uint32_t t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) { delay(200); Serial.print('.'); }
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.printf("\n[SYNC] Trying WiFi '%s'", SYNC_SSID2);
+        WiFi.begin(SYNC_SSID2, SYNC_PASS2);
+        t0 = millis();
+        while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) { delay(200); Serial.print('.'); }
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.printf("\n[SYNC] Ready — open  http://%s/\n", WiFi.localIP().toString().c_str());
+    } else {
+        Serial.println("\n[SYNC] WiFi failed — check SYNC_SSID/PASS in config.h");
+    }
+
+    server.on("/",     handleIndex);
+    server.on("/dl",   handleDownload);
+    server.on("/wipe", handleWipe);
+    server.begin();
+    mode = MODE_SYNC;
+}
+
+static void exitSyncMode() {
+    Serial.println("[SYNC] USB removed — resuming record mode");
+    server.stop();
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    mode = MODE_RECORD;
+    disconnectedAt = 0;
+    // Restart the scan so we reconnect to the strap and open a new session.
+    NimBLEDevice::getScan()->start(0, false);
+}
+
+// USB host connection state, debounced. With ARDUINO_USB_CDC_ON_BOOT, `Serial`
+// (the USB CDC) reports true once a host has opened the port — i.e. you've
+// plugged into a computer. Debounced so a flaky line doesn't thrash modes.
+static bool usbConnectedDebounced() {
+    static bool    state    = false;
+    static bool    candidate = false;
+    static uint32_t since   = 0;
+    bool now = (bool)Serial;
+    if (now != candidate) { candidate = now; since = millis(); }
+    if (candidate != state && millis() - since > 750) state = candidate;
+    return state;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 void setup() {
-    // Optional peripheral power-enable (unused on the XIAO; PIN_POWER_ON = -1).
     if (PIN_POWER_ON >= 0) {
         pinMode(PIN_POWER_ON, OUTPUT);
         digitalWrite(PIN_POWER_ON, HIGH);
     }
-
     pinMode(PIN_BL, OUTPUT);
-    digitalWrite(PIN_BL, HIGH);
+    ledOff();
 
     Serial.begin(115200);
-    delay(1000);
 
     hrQueue  = xQueueCreate(QUEUE_LEN, sizeof(HRReading));
     accQueue = xQueueCreate(QUEUE_LEN_ACC, sizeof(ACCSample));
 
-    // Station-only: no SoftAP / web server / captive portal. The control page runs
-    // in a browser and talks to the ESP over MQTT, so the ESP just needs WiFi+BLE.
-    // connectWiFi() walks the network list and blocks until one joins.
-    connectWiFi();
+    if (!LittleFS.begin(true)) {   // format-on-fail: first boot formats the region
+        Serial.println("[FS] LittleFS mount failed");
+    } else {
+        Serial.printf("[FS] LittleFS: %s used of %s\n",
+                      humanSize(LittleFS.usedBytes()).c_str(),
+                      humanSize(LittleFS.totalBytes()).c_str());
+    }
 
-    flashOnBL();
-
-    // MQTT over TLS to HiveMQ Cloud.
-    // setInsecure() skips server-certificate validation — simplest to get running.
-    // For real cert pinning, replace with secureClient.setCACert(<HiveMQ root CA>).
-    secureClient.setInsecure();
-    mqtt.setServer(MQTT_HOST, MQTT_PORT);
-    mqtt.setCallback(onMqtt);   // handle inbound start/stop commands
-    mqtt.setBufferSize(8192);   // ACC batches are large; well above PubSubClient's 256-byte default
-    mqttConnect();
+    // WiFi stays off until sync mode.
+    WiFi.mode(WIFI_OFF);
 
     NimBLEDevice::init("ESP32-Polar");
     // Polar PMD only streams over an encrypted link. Bond, Just-Works (no MITM),
-    // LE Secure Connections — so the H10 will emit the ACC indications/data.
+    // LE Secure Connections — so the H10 will emit the ACC data.
     NimBLEDevice::setSecurityAuth(true, false, true);
     auto* scan = NimBLEDevice::getScan();
     scan->setScanCallbacks(new ScanCB(), false);
@@ -611,65 +607,34 @@ void setup() {
     Serial.println("[BLE] Scanning for Polar H10...");
 }
 
-static uint32_t lastSend      = 0;
-static uint32_t lastAccSend   = 0;
-static uint32_t lastBLTick    = 0;
-static uint32_t lastStatusPub = 0;
-static bool     blState       = false;
+void loop() {
+    // Mode switching driven by USB presence.
+    bool usb = usbConnectedDebounced();
+    if (usb && mode == MODE_RECORD) enterSyncMode();
+    else if (!usb && mode == MODE_SYNC) exitSyncMode();
 
-// Drive the status LED so it tells the whole truth, not just the BLE link:
-//   fast blink → WiFi down    slow blink → WiFi up but strap or broker missing
-//   solid on   → fully online (WiFi + broker + strap all connected)
-// Previously the LED went solid the moment the strap connected, so it stayed lit
-// even when the uplink had dropped and the control page couldn't see the ESP.
-static void updateStatusLed() {
-    bool wifiUp = WiFi.status() == WL_CONNECTED;
-    if (wifiUp && mqtt.connected() && connected) {
-        digitalWrite(PIN_BL, LOW);   // solid = control page sees us AND the strap is live
+    if (mode == MODE_SYNC) {
+        server.handleClient();
+        updateStatusLed();
+        delay(2);
         return;
     }
-    uint32_t period = wifiUp ? BLE_BLINK_MS : WIFI_BLINK_MS;
-    uint32_t now = millis();
-    if (now - lastBLTick >= period) {
-        lastBLTick = now;
-        blState = !blState;
-        digitalWrite(PIN_BL, blState ? HIGH : LOW);
-    }
-}
 
-void loop() {
-    if (mqtt.connected()) mqtt.loop();
-    else                  receiverOk = false;
-
-    ensureWiFi();   // bring the uplink back if it dropped (was: offline until reboot)
-
+    // ── Record mode ──────────────────────────────────────────────────────────
     if (doConnect) {
         doConnect = false;
         connectToPolar();
     }
 
-    // No strap: keep the BLE scan running so we can find it again.
+    // No strap: keep scanning so we can find it again.
     if (!connected && pClient == nullptr && !NimBLEDevice::getScan()->isScanning()) {
         NimBLEDevice::getScan()->start(0, false);
         Serial.println("[BLE] Restarted scan");
     }
 
+    serviceSessionLifecycle();
+    serviceRecording();
     updateStatusLed();
-
-    if (millis() - lastSend >= BATCH_MS) {
-        lastSend = millis();
-        if (WiFi.status() == WL_CONNECTED) sendBatch();
-    }
-
-    if (millis() - lastAccSend >= ACC_BATCH_MS) {
-        lastAccSend = millis();
-        if (WiFi.status() == WL_CONNECTED) sendAccBatch();
-    }
-
-    if (millis() - lastStatusPub >= ESP_STATUS_MS) {
-        lastStatusPub = millis();
-        publishEspStatus();
-    }
 
     delay(10);
 }
