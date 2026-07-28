@@ -158,11 +158,18 @@ static void openSession() {
     Serial.printf("[REC] Session %04u opened\n", sessionNum);
 }
 
-// Finalize the open session (flush + close both files).
+static void flushHR();   // defined below; drain queued readings into the open file
+static void flushACC();
+
+// Finalize the open session: drain whatever is still queued, then close both
+// files. Draining first means readings buffered in the last flush interval
+// aren't lost when the strap drops or we switch to sync mode.
 static void closeSession() {
     if (!sessionActive) return;
-    if (hrFile)  { hrFile.flush();  hrFile.close();  }
-    if (accFile) { accFile.flush(); accFile.close(); }
+    flushHR();
+    flushACC();
+    if (hrFile)  { hrFile.close();  }
+    if (accFile) { accFile.close(); }
     Serial.printf("[REC] Session %04u closed\n", sessionNum);
     sessionActive = false;
 }
@@ -373,32 +380,43 @@ class ClientCB : public NimBLEClientCallbacks {
 };
 
 // ── Connect to Polar, subscribe to HR + ACC, open/resume the session ─────────
-static bool connectToPolar() {
-    pClient = NimBLEDevice::createClient();
-    pClient->setClientCallbacks(new ClientCB(), false);
+// Uses a LOCAL client handle throughout: the strap can drop mid-setup and the
+// onDisconnect callback (NimBLE task) nulls the global pClient, so re-reading the
+// global here would dereference null. We hold our own pointer and bail out via
+// isConnected() checks instead.
+static ClientCB clientCb;   // one shared callbacks instance (not per-connect)
 
-    if (!pClient->connect(polarAddr)) {
+static bool connectToPolar() {
+    // Reuse a previously-created (now disconnected) client so repeated reconnects
+    // don't exhaust NimBLE's small client pool.
+    NimBLEClient* cl = NimBLEDevice::getDisconnectedClient();
+    if (!cl) cl = NimBLEDevice::createClient();
+    if (!cl) { Serial.println("[BLE] No client available"); return false; }
+    cl->setClientCallbacks(&clientCb, false);
+    pClient = cl;
+
+    if (!cl->connect(polarAddr)) {
         Serial.println("[BLE] Connect failed");
-        NimBLEDevice::deleteClient(pClient);
-        pClient = nullptr;
+        if (pClient == cl) pClient = nullptr;   // keep the client object for reuse
         return false;
     }
 
     // The Polar H10 only emits the PMD accelerometer stream over an encrypted link
     // (HR works in the clear, ACC does not). Bond/encrypt before touching PMD.
-    pClient->secureConnection();
+    cl->secureConnection();
+    if (!cl->isConnected()) { Serial.println("[BLE] Dropped during secure setup"); return false; }
 
-    auto* svc = pClient->getService(HR_SVC_UUID);
+    auto* svc = cl->getService(HR_SVC_UUID);
     if (!svc) {
         Serial.println("[BLE] HR service not found");
-        pClient->disconnect();
+        cl->disconnect();
         return false;
     }
 
     auto* chr = svc->getCharacteristic(HR_CHAR_UUID);
     if (!chr || !chr->canNotify()) {
         Serial.println("[BLE] HR char not found or not notifiable");
-        pClient->disconnect();
+        cl->disconnect();
         return false;
     }
 
@@ -414,7 +432,8 @@ static bool connectToPolar() {
 
     // ── Start the PMD accelerometer stream (best-effort; HR still works if absent)
     accStreaming = false;
-    auto* pmd = pClient->getService(PMD_SVC_UUID);
+    if (!cl->isConnected()) { Serial.println("[BLE] Dropped before PMD setup"); return true; }
+    auto* pmd = cl->getService(PMD_SVC_UUID);
     if (pmd) {
         auto* dataChr = pmd->getCharacteristic(PMD_DATA_UUID);
         auto* ctrlChr = pmd->getCharacteristic(PMD_CTRL_UUID);
