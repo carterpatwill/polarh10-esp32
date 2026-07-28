@@ -48,6 +48,7 @@ step-detector settings it saves (steps_model.json).
 
 import argparse
 import json
+import os
 import random
 import sqlite3
 from collections import namedtuple
@@ -59,7 +60,11 @@ import steps  # shared signal math: magnitude, gravity removal, peak finding
 
 # ── Where everything lives ───────────────────────────────────────────────────────
 DATA_DIR    = Path(__file__).parent
-DUMP_DB     = DATA_DIR / "hr_data.db"                       # latest pull (temporary)
+# Where the candidate recordings live. On the Mac this is the pulled dump
+# (data/hr_data.db, refreshed by dump-pi.sh). On the Pi, set HR_DB to the live
+# receiver DB (server/hr_data.db) — the same env the dashboard reads — so new
+# recordings become label candidates the moment they're recorded.
+DUMP_DB     = Path(os.environ.get("HR_DB", DATA_DIR / "hr_data.db"))
 LIBRARY_DB  = DATA_DIR / "labeled_data" / "labeled_walks.db"  # permanent training data
 STEP_PARAMS = DATA_DIR / "steps_model.json"                 # from `steps.py calibrate`
 CLF_FILE    = DATA_DIR / "labeled_data" / "activity_model.joblib"  # the trained guesser

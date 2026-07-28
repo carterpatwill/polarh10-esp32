@@ -168,10 +168,28 @@ Recovery events found: 3
 - [ ] Storage: eventually a `recovery_metrics` table (per event) so numbers trend
       over time. Not phase 1.
 
-## Build order (when we start)
+## Build status
 
-1. `recovery.py` — load a session's hr + acc, reuse `activity.py` still/motion
-   detection to find peak→cooldown transitions, emit **per-event** HRR60/HRR120.
-2. Add resting HR (estimate + optional `resting` recording) → τ + time-to-baseline.
-3. HRV: RR flatten + clean → RMSSD rebound per event, resting RMSSD baseline.
-4. Persist per-event metrics for trending.
+**BUILT 2026-07-25 — `data/recovery.py`** (`events` / `plot` / `list`). HR+ACC align
+on the shared H10 `t_ms` clock. Reuses `activity.py`'s classifier for jog/run effort
+blocks; peak = max bpm near the motion drop; window → next jog/run, 300s cap, or end.
+Per-event HRR60/HRR120 + τ + time-to-baseline + RMSSD@60, all in one table. τ is
+gated (dur≥45s, drop≥6bpm, R²≥0.6, τ≤600s) so short/flat windows show "—" instead of
+a fake number. HRR won't interpolate across a >10s data gap. Defaults resting=53.
+
+**τ is fit over the DESCENT only** (peak → the recovery low), not the whole window —
+a window often runs into the next effort ramping back up, and that rising tail wrecks
+the exponential (e.g. session 39 #4: full-window R²≈0.60 borderline-reject → descent-
+only R²≈0.95, τ≈114s). When τ is still rejected but the fall is real (≥12 bpm over
+≥15 s), the plot / dashboard draws a **dashed straight peak→low guide** so an obvious
+recovery (a mid-workout stop that's just too noisy to fit) is shown rather than hidden;
+τ stays "—". Solid line = trustworthy exponential, dashed = guide.
+
+**Known limitation:** effort detection is **gait-based** — cycling/rowing raise HR
+without a running gait, so those sessions yield no events. A future HR-rise trigger
+would cover them.
+
+### Still to do
+- Persist per-event metrics (a `recovery_metrics` table) for cross-session trending.
+- Auto-estimate resting HR/RMSSD from calm `still` stretches (right now hardcoded 53/59).
+- Optional: HR-rise effort trigger for non-gait workouts (bike/row).

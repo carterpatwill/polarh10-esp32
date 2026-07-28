@@ -266,13 +266,75 @@ def session_timeline(sid):
     return jsonify(analyze(samples, bundle))
 
 
+def _hr_series_shared(sid):
+    """HR readings and RR beats on a shared-seconds clock (t=0 at the earlier of the
+    HR / ACC streams), plus the ACC stream's offset on that clock. Everything the
+    recovery math needs to line HR up against the activity timeline."""
+    import json
+    hr_rows = q("SELECT t_ms, bpm, rr_ms FROM hr WHERE session = ? ORDER BY t_ms", (sid,))
+    acc_min_row = one("SELECT MIN(t_ms) AS m FROM acc WHERE session = ?", (sid,))
+    if not hr_rows:
+        return None
+    acc_min = acc_min_row["m"] if acc_min_row else None
+    t0 = hr_rows[0]["t_ms"] if acc_min is None else min(hr_rows[0]["t_ms"], acc_min)
+
+    hr = [{"t": (r["t_ms"] - t0) / 1000.0, "bpm": r["bpm"]} for r in hr_rows]
+    rr_beats = []
+    for r in hr_rows:
+        if not r["rr_ms"]:
+            continue
+        try:
+            vals = json.loads(r["rr_ms"])
+        except Exception:
+            continue
+        for v in (vals if isinstance(vals, list) else [vals]):
+            rr_beats.append([(r["t_ms"] - t0) / 1000.0, float(v)])
+    acc_offset = 0.0 if acc_min is None else (acc_min - t0) / 1000.0
+    return hr, rr_beats, acc_offset
+
+
+@app.route("/api/session/<int:sid>/recovery")
+def session_recovery(sid):
+    """Per-effort heart-rate recovery (HRR60/120, τ, RMSSD@60) + chart overlay data.
+
+    Reuses the activity timeline the model already produces, so no re-classifying:
+    its jog/run segments mark the efforts whose cooldowns we score."""
+    try:
+        from activity_timeline import analyze as activity_analyze
+        import recovery_timeline
+        bundle = _get_model()
+    except Exception as e:
+        return jsonify({"error": f"recovery unavailable: {e}"}), 501
+    if bundle is None:
+        return jsonify({"error": f"no trained model at {MODEL_PATH}"}), 404
+
+    samples = _load_acc_samples(sid)
+    series = _hr_series_shared(sid)
+    if len(samples) == 0 or series is None:
+        return jsonify({"error": "session needs both HR and accelerometer data"}), 404
+    hr, rr_beats, acc_offset = series
+
+    # Activity segments are ACC-stream-relative; shift them onto the shared HR clock.
+    segs = activity_analyze(samples, bundle).get("segments", [])
+    for s in segs:
+        s["t0"] += acc_offset
+        s["t1"] += acc_offset
+
+    resting = request.args.get("resting", type=int) or recovery_timeline.RESTING_HR_BPM
+    return jsonify(recovery_timeline.analyze(hr, rr_beats, segs, resting=resting))
+
+
 # ── Self-service labeler (LOCAL ONLY) ─────────────────────────────────────────────
 # These endpoints let you grow the training library from the browser: see new
 # recordings, auto-trim the start/stop ramp, label jog/run/walk, and retrain — all
 # without the terminal. The logic lives in data/library_api.py (next to the trainer
-# and the library). On the Pi that folder isn't deployed, so the import fails and
-# the labeler simply isn't available — the workout dashboard is unaffected.
-_DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
+# and the library), found via LABELER_DATA (default: the repo's data/ dir). This is a
+# Mac-only workflow — the 1GB Pi is left lean for the receiver, so data/ isn't deployed
+# there and the import fails gracefully (label page shows "unavailable"). The env hook
+# stays so it CAN run elsewhere if that folder + ML deps are present.
+_DATA_DIR = Path(os.environ.get(
+    "LABELER_DATA",
+    Path(__file__).resolve().parent.parent.parent / "data"))
 
 
 def _labeler():

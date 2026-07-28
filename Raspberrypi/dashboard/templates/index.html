@@ -95,6 +95,20 @@
               border-radius: 999px; padding: 4px 10px; }
   .act-chip .dot { width: 9px; height: 9px; border-radius: 50%; }
   .act-chip b { color: var(--text); font-weight: 700; }
+
+  /* ---- recovery ---- */
+  .rec-sub { text-transform: none; letter-spacing: 0; font-weight: 400; color: var(--muted); }
+  table.rec { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 4px; }
+  table.rec th { text-align: right; color: var(--muted); font-weight: 600; font-size: 10px;
+                 text-transform: uppercase; letter-spacing: .5px; padding: 6px 10px;
+                 border-bottom: 1px solid var(--line); }
+  table.rec td { text-align: right; padding: 7px 10px; border-bottom: 1px solid #1a2233; }
+  table.rec th:first-child, table.rec td:first-child { text-align: left; }
+  table.rec td b { font-weight: 700; }
+  table.rec td .dim { color: var(--muted); }
+  .rec-pill { display: inline-flex; align-items: center; justify-content: center;
+              width: 20px; height: 20px; border-radius: 50%; background: #f85149;
+              color: #0d1117; font-weight: 700; font-size: 11px; }
 </style>
 </head>
 <body>
@@ -136,6 +150,11 @@
       <div class="chart-box"><canvas id="accChart"></canvas></div>
       <div id="actSummary" class="act-summary"></div>
       <div class="hint" style="margin-top:8px">Scroll / pinch to zoom · drag to pan left-right · double-click to reset</div>
+    </div>
+    <div class="chart-wrap" id="recWrap" style="display:none">
+      <h2>Recovery <span class="rec-sub" id="recHint"></span></h2>
+      <div class="cards" id="recCards"></div>
+      <div id="recTable"></div>
     </div>
   </section>
 
@@ -285,6 +304,53 @@ const activityBand = {
   }
 };
 
+// Draws recovery events onto the HR chart: shaded cooldown windows, the fitted
+// exponential decay curve, and a dot + number at each peak. Reads chart.$recovery.
+const recoveryOverlay = {
+  id: "recoveryOverlay",
+  afterDatasetsDraw(chart) {
+    const rec = chart.$recovery;
+    if (!rec || !rec.overlay) return;
+    const { ctx, chartArea: a, scales } = chart;
+    const xs = scales.x, ys = scales.y;
+    const clampX = t => Math.max(a.left, Math.min(a.right, xs.getPixelForValue(t)));
+    ctx.save();
+    // shaded cooldown windows
+    ctx.fillStyle = "#f85149";
+    for (const w of rec.overlay.windows) {
+      const x0 = clampX(w.t0), x1 = clampX(w.t1);
+      if (x1 <= x0) continue;
+      ctx.globalAlpha = 0.07; ctx.fillRect(x0, a.top, x1 - x0, a.bottom - a.top);
+    }
+    // recovery decay: solid = trustworthy exponential τ fit; dashed = straight
+    // peak→low guide (a real drop that was too noisy for a clean fit).
+    const fitted = rec.overlay.decay_fitted || [];
+    ctx.globalAlpha = 0.9; ctx.strokeStyle = "#f0b429"; ctx.lineWidth = 1.6;
+    rec.overlay.decays.forEach((curve, ci) => {
+      if (!curve || !curve.length) return;
+      ctx.setLineDash(fitted[ci] === false ? [5, 4] : []);
+      ctx.beginPath();
+      curve.forEach((p, i) => {
+        const x = xs.getPixelForValue(p.t), y = ys.getPixelForValue(p.bpm);
+        i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+      });
+      ctx.stroke();
+    });
+    ctx.setLineDash([]);
+    // peak dots + numbers
+    ctx.font = "700 10px -apple-system, sans-serif";
+    ctx.textAlign = "center"; ctx.textBaseline = "bottom";
+    for (const pk of rec.overlay.peaks) {
+      const x = xs.getPixelForValue(pk.t), y = ys.getPixelForValue(pk.bpm);
+      if (x < a.left || x > a.right) continue;
+      ctx.globalAlpha = 1; ctx.fillStyle = "#f85149";
+      ctx.beginPath(); ctx.arc(x, y, 4, 0, 2 * Math.PI); ctx.fill();
+      ctx.fillStyle = "#e6edf3"; ctx.fillText("#" + pk.n, x, y - 6);
+    }
+    ctx.restore();
+  }
+};
+
 function mkChart(id, datasets, yTitle, opts = {}) {
   const canvas = document.getElementById(id);
   const chart = new Chart(canvas, {
@@ -376,7 +442,7 @@ async function loadDetail(sid) {
   hrChart = mkChart("hrChart", [
     { label: "BPM", data: hrData, borderColor: "#f85149", fill: true,
       backgroundColor: "rgba(248,81,73,.08)" }
-  ], "BPM", { plugins: [activityBand], bottomPad: 34 });
+  ], "BPM", { plugins: [activityBand, recoveryOverlay], bottomPad: 34 });
   accChart = mkChart("accChart", [
     { label: "X", data: ax, borderColor: "#58a6ff" },
     { label: "Y", data: ay, borderColor: "#3fb950" },
@@ -384,6 +450,62 @@ async function loadDetail(sid) {
   ], "milli-g", { plugins: [activityBand], bottomPad: 34 });
 
   loadActivity(d.id);   // overlay the model's activity guess (async)
+  loadRecovery(d.id);   // per-effort HR recovery + overlay (async)
+}
+
+// Fetch per-effort recovery: overlay the HR chart and fill the recovery section.
+async function loadRecovery(sid) {
+  const wrap = document.getElementById("recWrap");
+  const hide = () => { wrap.style.display = "none";
+                       if (hrChart) { hrChart.$recovery = null; hrChart.update(); } };
+  let d;
+  try { d = await fetch(`/api/session/${sid}/recovery`).then(r => r.json()); }
+  catch (e) { return hide(); }
+  if (!d || d.error || !d.events || !d.events.length) return hide();
+
+  wrap.style.display = "";
+  if (hrChart) { hrChart.$recovery = d; hrChart.update(); }   // draw peaks/windows/decay
+
+  document.getElementById("recHint").textContent =
+    `⚡ ${d.events.length} event${d.events.length > 1 ? "s" : ""} · resting ${d.resting} bpm`;
+
+  // Headline cards — best of each metric across the session's efforts.
+  const ev = d.events;
+  const bestOf = (key, cmp) => ev.map(e => e[key]).filter(v => v != null)
+                                 .reduce((a, b) => cmp(a, b), null);
+  const best60  = bestOf("hrr60",   (a, b) => a == null ? b : Math.max(a, b));
+  const fastTau = bestOf("tau",     (a, b) => a == null ? b : Math.min(a, b));
+  const bestHrv = bestOf("rmssd60", (a, b) => a == null ? b : Math.max(a, b));
+  const card = (k, v) => `<div class="card"><div class="k">${k}</div><div class="v">${v}</div></div>`;
+  document.getElementById("recCards").innerHTML =
+    card("Best HRR60", best60 != null ? best60 + " bpm" : "–") +
+    card("Fastest τ",  fastTau != null ? fastTau + " s" : "–") +
+    card("HRV rebound", bestHrv != null ? bestHrv + " ms" : "–");
+
+  // Per-event table — every effort scored on its own row.
+  const cell = (v, suf = "") => v == null ? '<span class="dim">–</span>' : v + suf;
+  const rows = ev.map(e => {
+    const base = e.reached ? fmtElapsed(e.to_base)
+                           : `<span class="dim">&gt;${fmtElapsed(e.dur)}</span>`;
+    return `<tr>
+      <td><span class="rec-pill">${e.n}</span></td>
+      <td><b>${e.peak_bpm}</b></td>
+      <td>${fmtElapsed(e.peak_t)}</td>
+      <td>${cell(e.hrr60)}</td>
+      <td>${cell(e.hrr120)}</td>
+      <td>${cell(e.tau, " s")}</td>
+      <td>${base}</td>
+      <td>${cell(e.rmssd60, " ms")}</td>
+    </tr>`;
+  }).join("");
+  document.getElementById("recTable").innerHTML = `
+    <table class="rec">
+      <thead><tr>
+        <th>#</th><th>peak</th><th>@time</th><th>HRR60</th>
+        <th>HRR120</th><th>τ</th><th>to base</th><th>RMSSD@60</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
 }
 
 // ---------- tiny hash router ----------
