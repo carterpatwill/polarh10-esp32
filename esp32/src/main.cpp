@@ -22,8 +22,11 @@
 #include <Arduino.h>
 #include <NimBLEDevice.h>
 #include <WiFi.h>
-#include <WebServer.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
 #include <LittleFS.h>
+#include "soc/soc.h"                    // REG_READ
+#include "soc/usb_serial_jtag_reg.h"    // USB-Serial-JTAG SOF frame counter
 #include "config.h"
 
 static const char* HR_SVC_UUID  = "0000180D-0000-1000-8000-00805f9b34fb";
@@ -86,7 +89,12 @@ static bool      flashFull       = false;   // stopped writing: LittleFS below m
 // ── Operating mode ────────────────────────────────────────────────────────────
 enum Mode { MODE_RECORD, MODE_SYNC };
 static Mode      mode = MODE_RECORD;
-static WebServer server(80);
+
+// Sync-mode MQTT: TLS link to HiveMQ, over which we replay stored recordings.
+static WiFiClientSecure secureClient;
+static PubSubClient      mqtt(secureClient);
+static bool             syncUploaded = false;   // upload pass already run this sync session
+static bool usbHostPresent();                    // defined below (used by the upload driver)
 
 // ── Battery ───────────────────────────────────────────────────────────────────
 static int readBatteryPercent() {
@@ -326,9 +334,9 @@ static inline void ledOn()  { digitalWrite(PIN_BL, LOW);  }
 static inline void ledOff() { digitalWrite(PIN_BL, HIGH); }
 
 // Drive the LED to reflect the current state. Non-blocking; called every loop.
-//   solid            → recording (strap connected)
+//   solid            → recording (strap connected), or sync upload done
 //   slow blink       → scanning / no strap
-//   fast blink       → sync mode
+//   fast blink       → sync mode (searching WiFi / uploading)
 //   rapid triple     → flash full, recording stopped
 static void updateStatusLed() {
     static uint32_t lastTick = 0;
@@ -346,6 +354,7 @@ static void updateStatusLed() {
     }
 
     if (mode == MODE_RECORD && connected) { ledOn(); return; }  // solid
+    if (mode == MODE_SYNC && syncUploaded) { ledOn(); return; } // upload done → solid
 
     uint32_t period = (mode == MODE_SYNC) ? 150 : 700;         // fast vs slow blink
     if (now - lastTick >= period) {
@@ -442,6 +451,12 @@ static bool connectToPolar() {
             ctrlChr->subscribe(false, onPmdControl);       // indications for the command response
             pmdCtrlChr = ctrlChr;
             if (sessionActive) {
+                // Clear any stream still running from a prior connection first. The
+                // H10 keeps ACC going after the ESP drops, so a bare START then
+                // returns "already in state" (status 6) and no data flows. Stop,
+                // let it settle, then start clean → status 0.
+                ctrlChr->writeValue(PMD_STOP_ACC, sizeof(PMD_STOP_ACC), true);
+                delay(150);
                 if (ctrlChr->writeValue(PMD_START_ACC, sizeof(PMD_START_ACC), true)) {
                     Serial.printf("[ACC] Requested ACC stream @ %d Hz, ±%d g\n",
                                   ACC_SAMPLE_RATE, ACC_RANGE_G);
@@ -471,7 +486,7 @@ static void serviceSessionLifecycle() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Sync mode: bring WiFi up and serve the recordings over a tiny web page.
+// Sync mode: bring WiFi up and push every stored recording to the Pi over MQTT.
 // ─────────────────────────────────────────────────────────────────────────────
 static String humanSize(size_t b) {
     char buf[24];
@@ -481,54 +496,150 @@ static String humanSize(size_t b) {
     return String(buf);
 }
 
-static void handleIndex() {
-    size_t total = LittleFS.totalBytes(), used = LittleFS.usedBytes();
-    String html = F("<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
-                    "<title>Polar recordings</title>"
-                    "<style>body{font:15px system-ui;margin:2rem;max-width:640px}"
-                    "a{color:#06c}li{margin:.3rem 0}code{color:#555}</style>"
-                    "<h2>Polar recordings</h2>");
-    html += "<p><code>" + humanSize(used) + " used of " + humanSize(total) + "</code></p><ul>";
-    File root = LittleFS.open("/");
-    bool any = false;
-    for (File f = root.openNextFile(); f; f = root.openNextFile()) {
-        String name = f.name();
-        if (name.startsWith("/")) name = name.substring(1);
-        if (!name.startsWith("s")) continue;
-        any = true;
-        html += "<li><a href='/dl?f=" + name + "'>" + name + "</a> "
-                "<code>" + humanSize(f.size()) + "</code></li>";
+// How many rows we pack into one MQTT message. Kept well under the 8 KB publish
+// buffer once serialized (ACC rows are the longer of the two).
+static const int HR_BATCH_ROWS  = 40;
+static const int ACC_BATCH_ROWS = 120;
+
+// (Re)establish the MQTT link. Returns true once connected.
+static bool mqttConnect() {
+    if (mqtt.connected()) return true;
+    if (WiFi.status() != WL_CONNECTED) return false;
+    Serial.print("[MQTT] Connecting to "); Serial.print(MQTT_HOST); Serial.print("...");
+    if (mqtt.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASS)) {
+        Serial.println(" connected");
+        return true;
     }
-    if (!any) html += "<li><i>(no recordings)</i></li>";
-    html += "</ul><p><a href='/wipe' onclick=\"return confirm('Delete ALL recordings?')\">"
-            "Wipe all recordings</a></p>";
-    server.send(200, "text/html", html);
+    Serial.printf(" failed, rc=%d\n", mqtt.state());
+    return false;
 }
 
-static void handleDownload() {
-    String f = server.arg("f");
-    if (f.indexOf('/') >= 0 || !f.startsWith("s")) { server.send(400, "text/plain", "bad name"); return; }
-    String path = "/" + f;
-    File file = LittleFS.open(path, FILE_READ);
-    if (!file) { server.send(404, "text/plain", "not found"); return; }
-    server.sendHeader("Content-Disposition", "attachment; filename=" + f);
-    server.streamFile(file, "text/csv");
-    file.close();
+// Publish a session start/stop marker so the Pi opens/closes a session row and
+// tags the data that follows. `label` (may be nullptr) names the session.
+static bool publishSession(const char* action, const char* label) {
+    String s = "{\"action\":\""; s += action; s += "\"";
+    if (label && label[0]) { s += ",\"label\":\""; s += label; s += "\""; }
+    s += "}";
+    return mqtt.publish(MQTT_TOPIC_SESSION, s.c_str());
 }
 
-static void handleWipe() {
-    File root = LittleFS.open("/");
-    String victims[64];
-    int n = 0;
-    for (File f = root.openNextFile(); f && n < 64; f = root.openNextFile()) {
-        String name = f.name();
-        if (!name.startsWith("/")) name = "/" + name;
-        if (name.startsWith("/s")) victims[n++] = name;
+// Replay one HR CSV (t_ms,bpm,rr_ms) as batched polar/hr messages. The Pi expects
+// {"readings":[{"t_ms":..,"bpm":..,"rr_ms":[..]}, ...]}.
+static bool uploadHrFile(File& f) {
+    f.readStringUntil('\n');   // skip the "t_ms,bpm,rr_ms" header
+    String batch; int n = 0;
+    auto flush = [&]() -> bool {
+        if (n == 0) return true;
+        String body = "{\"readings\":["; body += batch; body += "]}";
+        bool ok = mqtt.publish(MQTT_TOPIC, body.c_str());
+        mqtt.loop(); batch = ""; n = 0; delay(20);
+        return ok;
+    };
+    while (f.available()) {
+        String line = f.readStringUntil('\n'); line.trim();
+        if (line.length() == 0) continue;
+        int c1 = line.indexOf(',');
+        int c2 = line.indexOf(',', c1 + 1);
+        if (c1 < 0) continue;
+        String t   = line.substring(0, c1);
+        String bpm = (c2 < 0) ? line.substring(c1 + 1) : line.substring(c1 + 1, c2);
+        String rr  = (c2 < 0) ? String("") : line.substring(c2 + 1);
+        String obj = "{\"t_ms\":"; obj += t; obj += ",\"bpm\":"; obj += bpm;
+        if (rr.length()) { rr.replace(";", ","); obj += ",\"rr_ms\":["; obj += rr; obj += "]"; }
+        obj += "}";
+        if (n) batch += ",";
+        batch += obj; n++;
+        if (n >= HR_BATCH_ROWS || batch.length() > 3000) { if (!flush()) return false; }
     }
-    for (int i = 0; i < n; i++) LittleFS.remove(victims[i]);
-    Serial.printf("[SYNC] Wiped %d files\n", n);
-    server.sendHeader("Location", "/");
-    server.send(303);
+    return flush();
+}
+
+// Replay one ACC CSV (t_ms,x,y,z) as batched polar/acc messages. The Pi expects
+// {"sample_rate_hz":25,"samples":[[t_ms,x,y,z], ...]}.
+static bool uploadAccFile(File& f) {
+    String first = f.readStringUntil('\n');           // "# sample_rate..." comment
+    if (first.startsWith("#")) f.readStringUntil('\n'); // then the "t_ms,x,y,z" header
+    String batch; int n = 0;
+    auto flush = [&]() -> bool {
+        if (n == 0) return true;
+        String body = "{\"sample_rate_hz\":"; body += ACC_SAMPLE_RATE;
+        body += ",\"range_g\":"; body += ACC_RANGE_G;
+        body += ",\"samples\":["; body += batch; body += "]}";
+        bool ok = mqtt.publish(MQTT_TOPIC_ACC, body.c_str());
+        mqtt.loop(); batch = ""; n = 0; delay(20);
+        return ok;
+    };
+    while (f.available()) {
+        String line = f.readStringUntil('\n'); line.trim();
+        if (line.length() == 0 || line.startsWith("#") || line.startsWith("t")) continue;
+        if (n) batch += ",";
+        batch += "["; batch += line; batch += "]";    // line is already "t_ms,x,y,z"
+        n++;
+        if (n >= ACC_BATCH_ROWS || batch.length() > 3000) { if (!flush()) return false; }
+    }
+    return flush();
+}
+
+// Upload one session (both CSVs) to the Pi, then delete the files on success. A
+// failed upload leaves the files in place so the next plug-in retries.
+static void uploadSession(uint16_t num) {
+    char hrPath[24], accPath[24], label[8];
+    snprintf(hrPath,  sizeof(hrPath),  "/s%04u_hr.csv",  num);
+    snprintf(accPath, sizeof(accPath), "/s%04u_acc.csv", num);
+    snprintf(label,   sizeof(label),   "s%04u", num);
+
+    bool haveHr  = LittleFS.exists(hrPath);
+    bool haveAcc = LittleFS.exists(accPath);
+    if (!haveHr && !haveAcc) return;
+
+    Serial.printf("[SYNC] Uploading session %04u...\n", num);
+    if (!mqttConnect()) { Serial.println("[SYNC] MQTT not connected — aborting"); return; }
+
+    if (!publishSession("start", label)) { Serial.println("[SYNC] session start failed"); return; }
+    delay(250); mqtt.loop();
+
+    bool ok = true;
+    if (haveHr)        { File f = LittleFS.open(hrPath,  FILE_READ); ok = uploadHrFile(f);  f.close(); }
+    if (ok && haveAcc) { File f = LittleFS.open(accPath, FILE_READ); ok = uploadAccFile(f); f.close(); }
+
+    delay(100); mqtt.loop();
+    publishSession("stop", nullptr);
+    delay(100); mqtt.loop();
+
+    if (ok) {
+        if (haveHr)  LittleFS.remove(hrPath);
+        if (haveAcc) LittleFS.remove(accPath);
+        Serial.printf("[SYNC] Session %04u uploaded and cleared\n", num);
+    } else {
+        Serial.printf("[SYNC] Session %04u upload incomplete — kept for retry\n", num);
+    }
+}
+
+// Find every stored session on flash and upload each in order (oldest first).
+static void runUploads() {
+    uint16_t nums[64]; int cnt = 0;
+    File root = LittleFS.open("/");
+    for (File f = root.openNextFile(); f && cnt < 64; f = root.openNextFile()) {
+        const char* n = f.name();
+        const char* p = strrchr(n, '/'); if (p) n = p + 1;
+        if (n[0] != 's') continue;
+        uint16_t num = (uint16_t)atoi(n + 1);
+        bool seen = false;
+        for (int i = 0; i < cnt; i++) if (nums[i] == num) { seen = true; break; }
+        if (!seen) nums[cnt++] = num;
+    }
+    if (cnt == 0) { Serial.println("[SYNC] No recordings to upload"); return; }
+    for (int i = 0; i < cnt; i++)        // ascending order
+        for (int j = i + 1; j < cnt; j++)
+            if (nums[j] < nums[i]) { uint16_t t = nums[i]; nums[i] = nums[j]; nums[j] = t; }
+
+    Serial.printf("[SYNC] %d session(s) to upload\n", cnt);
+    for (int i = 0; i < cnt; i++) {
+        if (!usbHostPresent()) { Serial.println("[SYNC] USB removed mid-upload — stopping"); break; }
+        uploadSession(nums[i]);
+        updateStatusLed();
+    }
+    Serial.println("[SYNC] Upload pass complete");
 }
 
 static void enterSyncMode() {
@@ -541,32 +652,43 @@ static void enterSyncMode() {
 
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);
+    // Fast-blink the LED while we search for WiFi so a plug-in shows activity
+    // immediately (this join runs before the loop's updateStatusLed() takes over).
+    bool ledPhase = false;
     Serial.printf("[SYNC] Joining WiFi '%s'", SYNC_SSID);
     WiFi.begin(SYNC_SSID, SYNC_PASS);
     uint32_t t0 = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) { delay(200); Serial.print('.'); }
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) {
+        delay(150); Serial.print('.');
+        ledPhase = !ledPhase; digitalWrite(PIN_BL, ledPhase ? LOW : HIGH);
+    }
     if (WiFi.status() != WL_CONNECTED) {
         Serial.printf("\n[SYNC] Trying WiFi '%s'", SYNC_SSID2);
         WiFi.begin(SYNC_SSID2, SYNC_PASS2);
         t0 = millis();
-        while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) { delay(200); Serial.print('.'); }
+        while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) {
+            delay(150); Serial.print('.');
+            ledPhase = !ledPhase; digitalWrite(PIN_BL, ledPhase ? LOW : HIGH);
+        }
     }
     if (WiFi.status() == WL_CONNECTED) {
-        Serial.printf("\n[SYNC] Ready — open  http://%s/\n", WiFi.localIP().toString().c_str());
+        Serial.printf("\n[SYNC] WiFi up, IP %s — pushing recordings to the Pi\n",
+                      WiFi.localIP().toString().c_str());
+        secureClient.setInsecure();          // HiveMQ TLS; no cert pinning (matches old build)
+        mqtt.setServer(MQTT_HOST, MQTT_PORT);
+        mqtt.setBufferSize(8192);            // batches are large; PubSubClient defaults to 256
+        mqttConnect();
     } else {
         Serial.println("\n[SYNC] WiFi failed — check SYNC_SSID/PASS in config.h");
     }
 
-    server.on("/",     handleIndex);
-    server.on("/dl",   handleDownload);
-    server.on("/wipe", handleWipe);
-    server.begin();
+    syncUploaded = false;   // the loop runs one upload pass once the link is up
     mode = MODE_SYNC;
 }
 
 static void exitSyncMode() {
     Serial.println("[SYNC] USB removed — resuming record mode");
-    server.stop();
+    if (mqtt.connected()) mqtt.disconnect();
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
     mode = MODE_RECORD;
@@ -575,17 +697,28 @@ static void exitSyncMode() {
     NimBLEDevice::getScan()->start(0, false);
 }
 
-// USB host connection state, debounced. With ARDUINO_USB_CDC_ON_BOOT, `Serial`
-// (the USB CDC) reports true once a host has opened the port — i.e. you've
-// plugged into a computer. Debounced so a flaky line doesn't thrash modes.
-static bool usbConnectedDebounced() {
-    static bool    state    = false;
-    static bool    candidate = false;
-    static uint32_t since   = 0;
-    bool now = (bool)Serial;
-    if (now != candidate) { candidate = now; since = millis(); }
-    if (candidate != state && millis() - since > 750) state = candidate;
-    return state;
+// USB host presence via the USB-Serial-JTAG SOF frame counter.
+//
+// `(bool)Serial` only reflects DTR — set when a program *opens* the port — so a
+// plain plug-in with no serial monitor never tripped sync (and a dumb charger
+// looked the same as a laptop). The SOF frame index instead advances every 1 ms
+// whenever a real USB host has enumerated the board, and stays frozen on battery
+// or a dumb charger. We sample it and treat "advancing" as host-present.
+static inline uint32_t sofFrame() {
+    return REG_READ(USB_SERIAL_JTAG_FRAM_NUM_REG) & USB_SERIAL_JTAG_SOF_FRAME_INDEX;
+}
+static bool usbHostPresent() {
+    static uint32_t prev = 0, lastChange = 0, lastSample = 0;
+    static bool     seeded = false, present = false;
+    uint32_t now = millis();
+    if (now - lastSample >= 120) {
+        lastSample = now;
+        uint32_t f = sofFrame();
+        if (seeded && f != prev) { lastChange = now; present = true; }  // frames moving → host
+        prev = f; seeded = true;
+    }
+    if (present && now - lastChange > 1500) present = false;            // frozen → no host
+    return present;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -628,14 +761,20 @@ void setup() {
 
 void loop() {
     // Mode switching driven by USB presence.
-    bool usb = usbConnectedDebounced();
+    bool usb = usbHostPresent();
     if (usb && mode == MODE_RECORD) enterSyncMode();
     else if (!usb && mode == MODE_SYNC) exitSyncMode();
 
     if (mode == MODE_SYNC) {
-        server.handleClient();
+        // Once WiFi + MQTT are up, run a single pass that pushes every stored
+        // recording to the Pi, then idle (solid LED) until USB is removed.
+        if (!syncUploaded && WiFi.status() == WL_CONNECTED && mqttConnect()) {
+            runUploads();
+            syncUploaded = true;
+        }
+        mqtt.loop();
         updateStatusLed();
-        delay(2);
+        delay(5);
         return;
     }
 
