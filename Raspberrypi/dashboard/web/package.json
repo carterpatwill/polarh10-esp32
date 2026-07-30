@@ -1,0 +1,24 @@
+{
+  "name": "polar-dashboard",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "React front-end for the ESP32 Polar H10 dashboard. Built to ../static/dist and served by Flask (api/). Never runs on the Pi — build here, ship the bundle.",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "chart.js": "^4.4.1",
+    "chartjs-plugin-zoom": "^2.0.1",
+    "hammerjs": "^2.0.8",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.26.2"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.1",
+    "vite": "^5.4.0"
+  }
+}

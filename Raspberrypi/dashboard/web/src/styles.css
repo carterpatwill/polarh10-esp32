@@ -1,0 +1,201 @@
+/* Dashboard styles. Merged from the old index.html + label.html; the label-only
+   rules are scoped under .label-page so its .card (candidate) doesn't collide with
+   the detail view's .card (stat tile). */
+
+:root {
+  --bg: #0d1117; --panel: #161b22; --line: #30363d;
+  --text: #e6edf3; --muted: #8b949e; --blue: #58a6ff;
+  --red: #f85149; --green: #3fb950; --amber: #d29922;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0 auto; background: var(--bg); color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  padding: 16px; max-width: 1100px;
+}
+a { color: var(--blue); text-decoration: none; }
+h1 { font-size: 20px; margin: 0 0 16px; font-weight: 600; }
+h1 .sub { color: var(--muted); font-weight: 400; font-size: 13px; }
+.hidden { display: none !important; }
+
+/* ---- top-level tabs (Workouts | Training) ---- */
+.tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); margin: 0 0 18px; }
+.tab { background: none; border: none; color: var(--muted); cursor: pointer;
+       font: inherit; font-size: 14px; font-weight: 600; padding: 10px 16px;
+       border-bottom: 2px solid transparent; margin-bottom: -1px; }
+.tab:hover { color: var(--text); }
+.tab.active { color: var(--text); border-bottom-color: var(--blue); }
+.tab .count { color: var(--muted); font-weight: 400; font-size: 12px; margin-left: 6px; }
+.tab.active .count { color: var(--blue); }
+
+/* ---- top-level areas (Training vs Workouts) ---- */
+.area { margin-bottom: 30px; }
+.area-note { color: var(--muted); font-size: 12px; margin: 0 0 16px; }
+
+/* ---- session list ---- */
+.date-group { margin-bottom: 22px; }
+.date-head { color: var(--muted); font-size: 12px; text-transform: uppercase;
+             letter-spacing: .6px; margin: 0 0 8px; font-weight: 600; }
+
+/* ---- bucket badges (walk/jog/run/sprint/other) ---- */
+.badge { display: inline-block; font-size: 10px; font-weight: 700; text-transform: uppercase;
+         letter-spacing: .5px; padding: 2px 8px; border-radius: 999px; border: 1px solid;
+         vertical-align: middle; }
+.badge.walk   { color: var(--blue);  border-color: var(--blue);  background: rgba(88,166,255,.10); }
+.badge.jog    { color: var(--green); border-color: var(--green); background: rgba(63,185,80,.10); }
+.badge.run    { color: var(--amber); border-color: var(--amber); background: rgba(210,153,34,.10); }
+.badge.sprint { color: var(--red);   border-color: var(--red);   background: rgba(248,81,73,.10); }
+.badge.other,
+.badge.metric { color: var(--muted); border-color: var(--line);  background: transparent; }
+.session {
+  display: flex; align-items: center; gap: 14px; cursor: pointer;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+  padding: 14px 16px; margin-bottom: 8px; transition: border-color .12s, background .12s;
+}
+.session:hover { border-color: var(--blue); background: #1a2233; }
+.session .label { font-size: 16px; font-weight: 600; }
+.session .when { color: var(--muted); font-size: 12px; margin-top: 2px; }
+.session .grow { flex: 1; }
+.session .metrics { display: flex; gap: 18px; text-align: right; }
+.session .metric .v { font-size: 15px; font-weight: 700; }
+.session .metric .k { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .5px; }
+.session .chev { color: var(--muted); font-size: 20px; }
+.empty { color: var(--muted); padding: 40px 0; text-align: center; }
+
+/* ---- per-row actions (rename / delete) ---- */
+.session .actions { display: flex; gap: 6px; }
+.row-btn { font-size: 13px; line-height: 1; color: var(--muted); background: var(--bg);
+           border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px;
+           cursor: pointer; opacity: 0; transition: opacity .12s, border-color .12s, color .12s; }
+.session:hover .row-btn { opacity: 1; }
+.row-btn:hover { color: #fff; border-color: var(--blue); }
+.row-btn.del:hover { color: var(--red); border-color: var(--red); }
+/* touch devices have no hover, so always show the buttons there */
+@media (hover: none) { .row-btn { opacity: 1; } }
+
+/* ---- detail ---- */
+.back { display: inline-flex; align-items: center; gap: 6px; margin-bottom: 14px;
+        font-size: 14px; cursor: pointer; }
+.rename-btn { margin-left: 12px; vertical-align: middle; font-size: 12px; font-weight: 600;
+              color: var(--muted); background: var(--panel); border: 1px solid var(--line);
+              border-radius: 8px; padding: 4px 10px; cursor: pointer; }
+.rename-btn:hover { color: #fff; border-color: var(--blue); }
+.rename-btn.del:hover { color: var(--red); border-color: var(--red); }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 10px; margin-bottom: 16px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+.card .k { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .5px; }
+.card .v { font-size: 22px; font-weight: 700; margin-top: 4px; }
+.card .v small { font-size: 12px; color: var(--muted); font-weight: 500; }
+.chart-wrap { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; margin-bottom: 16px; }
+.chart-wrap h2 { font-size: 13px; margin: 0 0 10px; color: var(--muted); font-weight: 600;
+                 text-transform: uppercase; letter-spacing: .5px;
+                 display: flex; align-items: center; gap: 8px; }
+.chart-wrap h2 .hint { text-transform: none; letter-spacing: 0; font-weight: 400; color: var(--muted); }
+.chart-wrap h2 .spacer { flex: 1; }
+.zoom-reset { text-transform: none; letter-spacing: 0; font: inherit; font-size: 11px;
+              color: var(--muted); background: var(--bg); border: 1px solid var(--line);
+              border-radius: 6px; padding: 3px 9px; cursor: pointer; }
+.zoom-reset:hover { color: var(--text); border-color: var(--blue); }
+.chart-box { position: relative; height: 300px; }
+
+/* ---- activity timeline summary (walk/jog/run/sprint/still %) ---- */
+.act-summary { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.act-chip { display: inline-flex; align-items: center; gap: 6px; font-size: 12px;
+            color: var(--muted); background: var(--bg); border: 1px solid var(--line);
+            border-radius: 999px; padding: 4px 10px; }
+.act-chip .dot { width: 9px; height: 9px; border-radius: 50%; }
+.act-chip b { color: var(--text); font-weight: 700; }
+
+/* ---- recovery ---- */
+.rec-sub { text-transform: none; letter-spacing: 0; font-weight: 400; color: var(--muted); }
+table.rec { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 4px; }
+table.rec th { text-align: right; color: var(--muted); font-weight: 600; font-size: 10px;
+               text-transform: uppercase; letter-spacing: .5px; padding: 6px 10px;
+               border-bottom: 1px solid var(--line); }
+table.rec th[data-tip] { cursor: help; text-decoration: underline dotted;
+                         text-underline-offset: 3px; text-decoration-color: var(--muted); }
+table.rec td { text-align: right; padding: 7px 10px; border-bottom: 1px solid #1a2233; }
+table.rec th:first-child, table.rec td:first-child { text-align: left; }
+table.rec td b { font-weight: 700; }
+table.rec td .dim { color: var(--muted); }
+.rec-pill { display: inline-flex; align-items: center; justify-content: center;
+            width: 20px; height: 20px; border-radius: 50%; background: #f85149;
+            color: #0d1117; font-weight: 700; font-size: 11px; }
+.rec-insight { font-size: 13.5px; line-height: 1.55; color: var(--muted);
+               background: var(--bg); border: 1px solid var(--line);
+               border-left: 3px solid #39d0d8; border-radius: 8px;
+               padding: 11px 14px; margin: 12px 0 4px; }
+.rec-insight:empty { display: none; }
+.rec-insight b { color: var(--text); font-weight: 700; }
+
+/* custom hover tooltip (native title= is slow/unreliable) */
+#tip { position: fixed; z-index: 1000; max-width: 260px; background: #1a2233;
+       color: var(--text); border: 1px solid var(--line); border-radius: 8px;
+       padding: 8px 11px; font-size: 12px; line-height: 1.45; font-weight: 400;
+       text-transform: none; letter-spacing: 0; pointer-events: none;
+       box-shadow: 0 8px 24px rgba(0,0,0,.45); opacity: 0; transition: opacity .1s;
+       transform: translateX(-50%); }
+#tip.show { opacity: 1; }
+
+/* ============ Label & Train page (scoped) ============ */
+.label-page .row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.label-page .sub { color: var(--muted); font-size: 13px; margin: 0 0 18px; }
+.label-page h1 { font-size: 20px; margin: 0 0 4px; font-weight: 600; }
+
+.label-page .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+                     padding: 14px 16px; margin-bottom: 12px; }
+
+/* library summary */
+.label-page .lib { display: flex; gap: 10px; flex-wrap: wrap; }
+.label-page .chip { border: 1px solid var(--line); border-radius: 999px; padding: 4px 12px;
+                    font-size: 13px; color: var(--muted); }
+.label-page .chip b { color: var(--text); }
+.label-page .chip.walk b { color: var(--blue); }
+.label-page .chip.jog b { color: var(--green); }
+.label-page .chip.run b { color: var(--amber); }
+.label-page .meta { color: var(--muted); font-size: 12px; }
+
+/* candidate card */
+.label-page .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+                    padding: 14px 16px; margin-bottom: 10px; }
+.label-page .card.done { opacity: .55; }
+.label-page .card h3 { margin: 0; font-size: 15px; font-weight: 600; }
+
+/* intensity bar */
+.label-page .bars { display: flex; align-items: flex-end; gap: 1px; height: 56px; margin: 10px 0 6px;
+                    background: #0b0f14; border: 1px solid var(--line); border-radius: 6px; padding: 4px; overflow: hidden; }
+.label-page .bar { flex: 1 1 0; min-width: 1px; background: #2d333b; border-radius: 1px; }
+.label-page .bar.keep { background: var(--amber); }
+.label-page .axis { color: var(--muted); font-size: 11px; display: flex; justify-content: space-between; }
+
+/* controls */
+.label-page .ctl { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+.label-page label.f { color: var(--muted); font-size: 12px; }
+.label-page input.t { width: 56px; background: #0b0f14; color: var(--text); border: 1px solid var(--line);
+                      border-radius: 6px; padding: 5px 7px; font: inherit; font-size: 13px; }
+.label-page .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.label-page .seg button { background: none; border: none; color: var(--muted); font: inherit; font-weight: 600;
+                          font-size: 13px; padding: 6px 14px; cursor: pointer; border-left: 1px solid var(--line); }
+.label-page .seg button:first-child { border-left: none; }
+.label-page .seg button.on.walk { background: rgba(88,166,255,.18); color: var(--blue); }
+.label-page .seg button.on.jog  { background: rgba(63,185,80,.18);  color: var(--green); }
+.label-page .seg button.on.run  { background: rgba(210,153,34,.18); color: var(--amber); }
+.label-page button.act { background: var(--blue); color: #04121f; border: none; border-radius: 8px;
+                         font: inherit; font-weight: 700; font-size: 13px; padding: 7px 16px; cursor: pointer; }
+.label-page button.act:disabled { background: var(--line); color: var(--muted); cursor: default; }
+.label-page button.ghost { background: none; border: 1px solid var(--line); color: var(--muted);
+                           border-radius: 8px; font: inherit; font-size: 12px; padding: 5px 10px; cursor: pointer; }
+.label-page .status { font-size: 12px; color: var(--muted); }
+.label-page .status.ok { color: var(--green); }
+.label-page .status.err { color: var(--red); }
+
+/* train result */
+.label-page #trainBtn { background: var(--green); color: #04140a; font-size: 15px; padding: 10px 22px; }
+.label-page #trainBtn:disabled { background: var(--line); color: var(--muted); }
+.label-page table.rep { border-collapse: collapse; margin-top: 10px; font-size: 13px; }
+.label-page table.rep th, .label-page table.rep td { border: 1px solid var(--line); padding: 5px 12px; text-align: right; }
+.label-page table.rep th:first-child, .label-page table.rep td:first-child { text-align: left; }
+.label-page .acc { font-size: 26px; font-weight: 700; }
+.label-page .cm td { font-variant-numeric: tabular-nums; }
+.label-page .cm .diag { color: var(--green); font-weight: 700; }
+.label-page .cm .off { color: var(--red); }

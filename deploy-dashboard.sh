@@ -16,6 +16,17 @@ PI_DIR="/home/carter/projects/python/esp-polar/dashboard"   # sibling of server
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 SRC="$ROOT/Raspberrypi/dashboard/"
 
+# Build the React front-end (web/ → static/dist) so the Pi gets the compiled
+# bundle only — it never runs Node. Skip if npm is missing but warn loudly.
+if command -v npm >/dev/null 2>&1; then
+    echo "→ Building React front-end (web/ → static/dist) ..."
+    ( cd "${SRC}web" && [ -d node_modules ] || npm install )
+    ( cd "${SRC}web" && npm run build )
+else
+    echo "⚠️  npm not found — skipping front-end build. The Pi will show 'Dashboard"
+    echo "    not built' until you run 'npm run build' in Raspberrypi/dashboard/web."
+fi
+
 # Ship the current trained activity model next to app.py so the timeline feature
 # works on the Pi. Copied fresh each deploy so a retrain always ships the latest.
 MODEL_SRC="$ROOT/data/labeled_data/activity_model.joblib"
@@ -27,8 +38,10 @@ else
 fi
 
 echo "→ Copying $SRC to $PI_HOST:$PI_DIR ..."
-# keep the Pi's own venv from being clobbered
+# Ship the API + built bundle (static/dist), not the React source or node_modules —
+# the Pi only serves the compiled files. Keep the Pi's own venv from being clobbered.
 rsync -av --exclude '.venv' --exclude '__pycache__' \
+      --exclude 'web' \
       "$SRC" "$PI_HOST:$PI_DIR/"
 
 echo "→ Installing deps + restarting service on the Pi ..."

@@ -19,3 +19,8 @@ data/dumps/
 
 # Activity model bundled into the dashboard at deploy time (source of truth: data/labeled_data/)
 Raspberrypi/dashboard/activity_model.joblib
+
+# React dashboard (web/): npm deps + Vite build output. Source is tracked; the
+# bundle is built on the Mac and rsynced to the Pi (see deploy-dashboard.sh).
+node_modules/
+Raspberrypi/dashboard/static/

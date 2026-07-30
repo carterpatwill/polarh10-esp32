@@ -53,6 +53,19 @@ PY
     echo "✓ Refreshed data/hr_data.db from the Pi (Pi left untouched)."
 fi
 
+# ── Build the React front-end so app.py has a bundle to serve ────────────────
+# The dashboard UI is now a React app (Raspberrypi/dashboard/web) built into
+# static/dist. Without this, app.py just serves a "Dashboard not built" page.
+WEB="$ROOT/Raspberrypi/dashboard/web"
+if command -v npm >/dev/null 2>&1; then
+    echo "→ Building the dashboard front-end ..."
+    ( cd "$WEB" && { [ -d node_modules ] || npm install; } && npm run build >/dev/null )
+    echo "✓ Front-end built."
+else
+    echo "⚠️  npm not found — can't build the UI. Install Node, or run 'npm run build'"
+    echo "    in $WEB once. Starting the API anyway."
+fi
+
 # ── Pick a Python that has the deps: the dashboard venv, else system python3 ──
 VENV_PY="$ROOT/Raspberrypi/dashboard/.venv/bin/python"
 if [ -x "$VENV_PY" ] && "$VENV_PY" -c "import flask, numpy, sklearn, pandas" 2>/dev/null; then
@@ -70,8 +83,8 @@ if lsof -ti "tcp:$PORT" >/dev/null 2>&1; then
 fi
 
 echo ""
-echo "→ Starting labeler at http://localhost:$PORT/label   (Ctrl-C to stop)"
-command -v open >/dev/null && (sleep 2; open "http://localhost:$PORT/label") &
+echo "→ Starting labeler at http://localhost:$PORT/#/label   (Ctrl-C to stop)"
+command -v open >/dev/null && (sleep 2; open "http://localhost:$PORT/#/label") &
 
 cd "$ROOT/Raspberrypi/dashboard"
 exec env HR_DB="$LOCAL_DB" ACTIVITY_MODEL="$MODEL" PORT="$PORT" \
