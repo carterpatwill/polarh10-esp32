@@ -10,6 +10,9 @@ __pycache__/
 .vscode/ipch
 compile_commands.json
 esp32/src/config.h
+# catch accidental Finder/editor duplicates (e.g. "config 2.h") but keep config.h.example
+esp32/src/config*.h
+!esp32/src/config.h.example
 hr_data.db
 mqtt.env
 data/dumps/
