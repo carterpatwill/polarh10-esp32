@@ -338,6 +338,82 @@ def find_events(hr_t, bpm, rr_beats, timeline, resting):
 
 
 # ════════════════════════════════════════════════════════════════════════════════
+# PART 4.5 — persist per-event metrics so recovery can be TRENDED over time
+# ════════════════════════════════════════════════════════════════════════════════
+# A single session's recovery numbers are computed fresh and thrown away. To answer
+# "am I getting fitter" we save one row per recovery EVENT (interval workouts have
+# several) into recovery_metrics, then compare like-for-like across sessions later.
+#
+# We store the RAW numbers only — no effort buckets, no HRmax policy — so how we
+# group "similar efforts" for the trend can change without a re-backfill.
+import datetime as _dt
+
+RECOVERY_TABLE = "recovery_metrics"
+
+# Columns we persist from a score_event() dict, in insert order.
+_METRIC_COLS = ("peak_t", "peak_bpm", "dur", "hrr60", "hrr120",
+                "tau", "to_base", "reached", "rmssd60")
+
+
+def ensure_recovery_table(conn):
+    """Create recovery_metrics if it isn't there. One row per (session, event)."""
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS {RECOVERY_TABLE} (
+            session      INTEGER NOT NULL,
+            event_idx    INTEGER NOT NULL,   -- 1-based, matches the `events` display
+            peak_t       REAL,               -- secs into the session that HR peaked
+            peak_bpm     REAL,               -- the peak (how hard — for matched-effort compare)
+            dur          REAL,               -- recovery-window length, secs
+            hrr60        REAL,               -- bpm dropped in first 60 s  (the headline)
+            hrr120       REAL,               -- bpm dropped in first 120 s
+            tau          REAL,               -- decay time-constant, secs (smaller = fitter)
+            to_base      REAL,               -- secs back to near-resting (NULL if never)
+            reached      INTEGER,            -- 1 if it got back to baseline in the window
+            rmssd60      REAL,               -- HRV rebound ~60 s post-peak, ms
+            resting_used INTEGER,            -- resting-HR floor these numbers assumed
+            computed_at  TEXT,              -- ISO time this row was (re)computed
+            PRIMARY KEY (session, event_idx)
+        )""")
+    conn.commit()
+
+
+def upsert_recovery(conn, sid, resting=RESTING_HR_BPM):
+    """(Re)compute every recovery event for one session and save it. Idempotent:
+    replaces the session's existing rows so re-running never duplicates and a session
+    that now finds fewer events doesn't leave stale ones behind. Returns the events."""
+    ensure_recovery_table(conn)
+    hr_t, bpm, rr_beats, acc, acc_t0 = load_session(conn, sid)
+    timeline = activity_timeline(acc, acc_t0)
+    events = find_events(hr_t, bpm, rr_beats, timeline, resting)
+
+    now = _dt.datetime.now().isoformat(timespec="seconds")
+    conn.execute(f"DELETE FROM {RECOVERY_TABLE} WHERE session=?", (sid,))
+    for i, e in enumerate(events, 1):
+        vals = [e[c] for c in _METRIC_COLS]
+        vals = [int(v) if isinstance(v, bool) else v for v in vals]   # reached → 0/1
+        conn.execute(
+            f"INSERT INTO {RECOVERY_TABLE} "
+            f"(session, event_idx, {', '.join(_METRIC_COLS)}, resting_used, computed_at) "
+            f"VALUES ({', '.join('?' * (len(_METRIC_COLS) + 4))})",
+            [sid, i, *vals, resting, now])
+    conn.commit()
+    return events
+
+
+# How we group "similar efforts" for a fair trend. Boundaries are on the PEAK HR the
+# recovery started from — comparing a max-effort drop to an easy-jog drop is apples to
+# oranges. Kept as read-time policy (not stored) so it's easy to tune.
+EFFORT_BUCKETS = ((0, 150, "moderate"), (150, 170, "hard"), (170, 999, "max"))
+
+
+def effort_bucket(peak_bpm):
+    for lo, hi, name in EFFORT_BUCKETS:
+        if lo <= peak_bpm < hi:
+            return name
+    return "?"
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 # PART 5 — commands
 # ════════════════════════════════════════════════════════════════════════════════
 def _pick_session(conn, session_arg):
@@ -414,6 +490,117 @@ def cmd_events(conn, args):
         print("→ Recovery slowing across the session (fatigue accumulating).")
 
 
+METRIC_KIND = "metric"   # real workouts; the walk/jog/run labeling clips are 'train'
+
+
+def cmd_backfill(conn, args):
+    """Compute + save recovery metrics for REAL workouts, so recovery can be trended.
+    By default only sessions tagged kind='metric' count — the walk/jog/run labeling
+    clips ('train') are short and would pollute the trend. Pass --all to include them.
+    Idempotent; run once to seed, then after each new recording (or just re-run it)."""
+    ensure_recovery_table(conn)
+    rows = conn.execute(
+        """SELECT s.id, s.label, COALESCE(s.kind,''),
+                  (SELECT COUNT(*) FROM hr  WHERE session=s.id),
+                  (SELECT COUNT(*) FROM acc WHERE session=s.id)
+             FROM sessions s ORDER BY s.id"""
+    ).fetchall()
+    if args.session is not None:
+        rows = [r for r in rows if r[0] == args.session]
+        if not rows:
+            sys.exit(f"No session with id {args.session}.")
+    elif not args.all:
+        rows = [r for r in rows if r[2] == METRIC_KIND]
+
+    scope = "all sessions" if args.all else f"kind={METRIC_KIND!r} (real workouts)"
+    print(f"Backfilling recovery metrics for {scope}.\n")
+    total_ev = done = skipped = 0
+    kept = []
+    print(f"{'id':>3}  {'kind':<7} {'label':<22} {'events':>7}")
+    print("-" * 44)
+    for sid, label, kind, hr_n, acc_n in rows:
+        if not hr_n or not acc_n:
+            print(f"{sid:>3}  {kind:<7} {(label or ''):<22} {'— no HR/ACC':>11}")
+            skipped += 1
+            continue
+        try:
+            events = upsert_recovery(conn, sid, args.resting)
+        except SystemExit as e:            # load_session bails on empty sessions
+            print(f"{sid:>3}  {kind:<7} {(label or ''):<22} {'— ' + str(e):>11}")
+            skipped += 1
+            continue
+        total_ev += len(events); done += 1; kept.append(sid)
+        print(f"{sid:>3}  {kind:<7} {(label or ''):<22} {len(events):>7}")
+
+    # Keep the table in sync with the filter: purge rows for sessions no longer in
+    # scope (e.g. training clips saved by an earlier unfiltered run). A single-session
+    # backfill only touches that session, so leave everything else alone.
+    purged = 0
+    if args.session is None:
+        cur = conn.execute(
+            f"DELETE FROM {RECOVERY_TABLE} "
+            f"WHERE session NOT IN ({','.join('?' * len(kept)) or 'NULL'})", kept)
+        purged = cur.rowcount
+        conn.commit()
+
+    print("-" * 44)
+    print(f"Saved {total_ev} recovery events across {done} sessions "
+          f"({skipped} skipped"
+          + (f", purged {purged} out-of-scope rows" if purged else "") + ").")
+    print("Now:  python recovery.py trend")
+
+
+def cmd_trend(conn, args):
+    """Show saved events grouped by matched effort, oldest→newest, so you can see
+    whether recovery is improving. Reads recovery_metrics (run backfill first)."""
+    ensure_recovery_table(conn)
+    rows = conn.execute(
+        f"""SELECT r.session, s.started, s.label, r.event_idx,
+                   r.peak_bpm, r.hrr60, r.hrr120, r.tau
+              FROM {RECOVERY_TABLE} r JOIN sessions s ON s.id = r.session
+             ORDER BY s.started, r.session, r.event_idx"""
+    ).fetchall()
+    if not rows:
+        print("No saved recovery metrics yet. Run:  python recovery.py backfill")
+        return
+
+    def s(v, w=6, f="{:.0f}"):
+        return (f.format(v) if v is not None else "—").rjust(w)
+
+    buckets = {name: [] for _, _, name in EFFORT_BUCKETS}
+    for r in rows:
+        buckets.setdefault(effort_bucket(r[4]), []).append(r)
+
+    for _, _, name in EFFORT_BUCKETS:
+        evs = buckets.get(name) or []
+        lo = next(b[0] for b in EFFORT_BUCKETS if b[2] == name)
+        hi = next(b[1] for b in EFFORT_BUCKETS if b[2] == name)
+        print(f"\n■ {name.upper()} effort  (peak {lo}–{hi} bpm)   {len(evs)} event(s)")
+        if not evs:
+            print("   (none yet)"); continue
+        print(f"   {'date':<11} {'sess':>4} {'#':>2} {'peak':>5} "
+              f"{'HRR60':>6} {'HRR120':>7} {'τ(s)':>6}")
+        for sess, started, label, idx, peak, hrr60, hrr120, tau in evs:
+            date = (started or "")[:10]
+            print(f"   {date:<11} {sess:>4} {idx:>2} {peak:>5.0f} "
+                  f"{s(hrr60)} {s(hrr120,7)} {s(tau,6)}")
+        # Cheap first↔last read so the trend is obvious even in the CLI.
+        h = [e[5] for e in evs if e[5] is not None]
+        t = [e[7] for e in evs if e[7] is not None]
+        if len(h) >= 2:
+            d = h[-1] - h[0]
+            print(f"   → HRR60 {h[0]:.0f}→{h[-1]:.0f} "
+                  f"({'+' if d >= 0 else ''}{d:.0f}, "
+                  f"{'faster recovery' if d > 0 else 'slower' if d < 0 else 'flat'})")
+        if len(t) >= 2:
+            d = t[-1] - t[0]
+            print(f"   → τ    {t[0]:.0f}→{t[-1]:.0f}s "
+                  f"({'+' if d >= 0 else ''}{d:.0f}s, "
+                  f"{'fitter' if d < 0 else 'slower' if d > 0 else 'flat'})")
+    print("\nMatched effort: compare within a bucket, not across. "
+          "Higher HRR60 / lower τ over time = getting fitter.")
+
+
 def cmd_plot(conn, args):
     import matplotlib.pyplot as plt
 
@@ -475,10 +662,22 @@ def main():
         c.add_argument("--resting", type=int, default=RESTING_HR_BPM,
                        help=f"resting HR floor in bpm (default: {RESTING_HR_BPM})")
 
+    bf = sub.add_parser("backfill",
+                        help="compute + SAVE recovery events for real workouts")
+    bf.add_argument("session", nargs="?", type=int,
+                    help="one session (default: all real workouts)")
+    bf.add_argument("--all", action="store_true",
+                    help="include training clips too (default: kind='metric' only)")
+    bf.add_argument("--resting", type=int, default=RESTING_HR_BPM,
+                    help=f"resting HR floor in bpm (default: {RESTING_HR_BPM})")
+
+    sub.add_parser("trend", help="saved events grouped by effort, oldest→newest")
+
     args = p.parse_args()
     conn = sqlite3.connect(args.db)
     try:
-        {"list": cmd_list, "events": cmd_events, "plot": cmd_plot}[args.cmd](conn, args)
+        {"list": cmd_list, "events": cmd_events, "plot": cmd_plot,
+         "backfill": cmd_backfill, "trend": cmd_trend}[args.cmd](conn, args)
     finally:
         conn.close()
 

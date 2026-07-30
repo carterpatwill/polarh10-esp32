@@ -116,6 +116,10 @@ table.rec th[data-tip] { cursor: help; text-decoration: underline dotted;
                          text-underline-offset: 3px; text-decoration-color: var(--muted); }
 table.rec td { text-align: right; padding: 7px 10px; border-bottom: 1px solid #1a2233; }
 table.rec th:first-child, table.rec td:first-child { text-align: left; }
+/* hover a row to spotlight that recovery on the HR chart above */
+table.rec tbody tr { cursor: pointer; transition: background .1s; }
+table.rec tbody tr:hover, table.rec tbody tr.hot { background: #1a2233; }
+table.rec tbody tr.hot td:first-child { box-shadow: inset 3px 0 0 #f0b429; }
 table.rec td b { font-weight: 700; }
 table.rec td .dim { color: var(--muted); }
 .rec-pill { display: inline-flex; align-items: center; justify-content: center;

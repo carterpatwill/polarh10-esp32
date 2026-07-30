@@ -189,7 +189,21 @@ recovery (a mid-workout stop that's just too noisy to fit) is shown rather than 
 without a running gait, so those sessions yield no events. A future HR-rise trigger
 would cover them.
 
+### Trending — BUILT 2026-07-30
+`recovery.py backfill` + `recovery.py trend` persist one row per event into a
+`recovery_metrics` table (in hr_data.db) and read them back grouped by matched
+effort (peak-HR buckets: moderate <150 / hard 150–170 / max ≥170). Idempotent
+(delete+insert per session, no dupes). **Backfill defaults to `kind='metric'`
+only** — the walk/jog/run labeling clips are `train` and would pollute the trend;
+`--all` overrides. A no-arg backfill also purges rows for sessions no longer in
+scope, so the table stays in sync with the filter.
+
+Reality check 2026-07-30: only **3 real workouts have events** (18 Biking, 25
+Individuals, 39 Pass rush = 53 events), all in one week — plumbing is correct but
+the trend is meaningless until more real workouts (WITH a cooldown) accumulate over
+weeks. Dashboard trend card deferred until there's data to show.
+
 ### Still to do
-- Persist per-event metrics (a `recovery_metrics` table) for cross-session trending.
+- Dashboard "recovery trend" card (API `/api/recovery/trend` + chart) — deferred, data too thin.
 - Auto-estimate resting HR/RMSSD from calm `still` stretches (right now hardcoded 53/59).
 - Optional: HR-rise effort trigger for non-gait workouts (bike/row).

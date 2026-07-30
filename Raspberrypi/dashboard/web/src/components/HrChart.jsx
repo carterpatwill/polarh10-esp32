@@ -4,7 +4,7 @@ import { mkChart, activityBand, recoveryOverlay } from "../lib/charts.js";
 // Heart-rate line with the activity band + recovery overlay plugins. Rebuilds when
 // the HR series changes; the activity/recovery overlays update the live chart in
 // place (so arriving async without a full redraw), matching the old behavior.
-export default function HrChart({ hr, activity, recovery }) {
+export default function HrChart({ hr, activity, recovery, highlight = null }) {
   const canvasRef = useRef(null);
   const chartRef = useRef(null);
 
@@ -15,6 +15,7 @@ export default function HrChart({ hr, activity, recovery }) {
     ], "BPM", { plugins: [activityBand, recoveryOverlay], bottomPad: 34 });
     chart.$activity = activity || null;
     chart.$recovery = recovery || null;
+    chart.$highlight = highlight;
     chartRef.current = chart;
     return () => chart.destroy();
   }, [hr]);
@@ -32,6 +33,14 @@ export default function HrChart({ hr, activity, recovery }) {
     c.$recovery = recovery || null;
     c.update();
   }, [recovery]);
+
+  // Spotlight a single recovery event (hover from the panel) without a full redraw.
+  useEffect(() => {
+    const c = chartRef.current;
+    if (!c) return;
+    c.$highlight = highlight;
+    c.update();
+  }, [highlight]);
 
   return (
     <div className="chart-wrap">

@@ -53,6 +53,11 @@ export const activityBand = {
 
 // Draws recovery events onto the HR chart: shaded cooldown windows, the fitted
 // exponential decay curve, and a dot + number at each peak. Reads chart.$recovery.
+//
+// chart.$highlight = an event number (`n`) to spotlight, or null for the normal
+// view. When set, that one event is drawn at full strength and every other event
+// is dimmed — so hovering a recovery row in the panel picks its line out of the
+// crowd. The red HR line itself is never touched, only this overlay.
 export const recoveryOverlay = {
   id: "recoveryOverlay",
   afterDatasetsDraw(chart) {
@@ -61,20 +66,33 @@ export const recoveryOverlay = {
     const { ctx, chartArea: a, scales } = chart;
     const xs = scales.x, ys = scales.y;
     const clampX = (t) => Math.max(a.left, Math.min(a.right, xs.getPixelForValue(t)));
+
+    // hl = the spotlighted event number, or null. lit(n) is true when `n` should
+    // be drawn bright: everything is lit when nothing is hovered, else only the
+    // hovered event. `on` scales an alpha down for the dimmed-out events.
+    const hl = chart.$highlight ?? null;
+    const lit = (n) => hl == null || n === hl;
+    const on = (n, bright, dim) => (lit(n) ? bright : dim);
+
     ctx.save();
-    // shaded cooldown windows
+    // shaded cooldown windows — the hovered one brightens, the rest fade back.
     ctx.fillStyle = "#f85149";
     for (const w of rec.overlay.windows) {
       const x0 = clampX(w.t0), x1 = clampX(w.t1);
       if (x1 <= x0) continue;
-      ctx.globalAlpha = 0.07; ctx.fillRect(x0, a.top, x1 - x0, a.bottom - a.top);
+      ctx.globalAlpha = on(w.n, hl == null ? 0.07 : 0.13, 0.03);
+      ctx.fillRect(x0, a.top, x1 - x0, a.bottom - a.top);
     }
     // recovery decay: solid = trustworthy exponential τ fit; dashed = straight
     // peak→low guide (a real drop that was too noisy for a clean fit).
     const fitted = rec.overlay.decay_fitted || [];
-    ctx.globalAlpha = 0.9; ctx.strokeStyle = "#f0b429"; ctx.lineWidth = 1.6;
+    const peaks = rec.overlay.peaks || [];
+    ctx.strokeStyle = "#f0b429";
     rec.overlay.decays.forEach((curve, ci) => {
       if (!curve || !curve.length) return;
+      const n = peaks[ci]?.n ?? ci + 1;
+      ctx.globalAlpha = on(n, 0.9, 0.18);
+      ctx.lineWidth = lit(n) && hl != null ? 2.6 : 1.6;
       ctx.setLineDash(fitted[ci] === false ? [5, 4] : []);
       ctx.beginPath();
       curve.forEach((p, i) => {
@@ -86,23 +104,26 @@ export const recoveryOverlay = {
     ctx.setLineDash([]);
     // initial recovery RATE: a straight cyan line = the bpm/min slope we report,
     // laid over the first minute of the fall so you can see the speed you're graded on.
-    ctx.globalAlpha = 0.95; ctx.strokeStyle = "#39d0d8"; ctx.lineWidth = 2.2;
+    ctx.strokeStyle = "#39d0d8";
     for (const s of (rec.overlay.slopes || [])) {
       if (!s) continue;
+      ctx.globalAlpha = on(s.n, 0.95, 0.18);
+      ctx.lineWidth = lit(s.n) && hl != null ? 3 : 2.2;
       ctx.beginPath();
       ctx.moveTo(xs.getPixelForValue(s.t0), ys.getPixelForValue(s.bpm0));
       ctx.lineTo(xs.getPixelForValue(s.t1), ys.getPixelForValue(s.bpm1));
       ctx.stroke();
     }
-    // peak dots + numbers
+    // peak dots + numbers — the hovered peak grows a little and the rest recede.
     ctx.font = "700 10px -apple-system, sans-serif";
     ctx.textAlign = "center"; ctx.textBaseline = "bottom";
-    for (const pk of rec.overlay.peaks) {
+    for (const pk of peaks) {
       const x = xs.getPixelForValue(pk.t), y = ys.getPixelForValue(pk.bpm);
       if (x < a.left || x > a.right) continue;
-      ctx.globalAlpha = 1; ctx.fillStyle = "#f85149";
-      ctx.beginPath(); ctx.arc(x, y, 4, 0, 2 * Math.PI); ctx.fill();
-      ctx.fillStyle = "#e6edf3"; ctx.fillText("#" + pk.n, x, y - 6);
+      const bright = lit(pk.n), big = bright && hl != null;
+      ctx.globalAlpha = on(pk.n, 1, 0.3); ctx.fillStyle = "#f85149";
+      ctx.beginPath(); ctx.arc(x, y, big ? 6 : 4, 0, 2 * Math.PI); ctx.fill();
+      ctx.fillStyle = "#e6edf3"; ctx.fillText("#" + pk.n, x, y - (big ? 8 : 6));
     }
     ctx.restore();
   },

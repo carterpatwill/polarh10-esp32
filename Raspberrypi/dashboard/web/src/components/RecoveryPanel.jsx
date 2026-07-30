@@ -36,7 +36,10 @@ const cell = (v, suf = "") => (v == null ? <span className="dim">–</span> : <>
 
 // Per-effort heart-rate recovery: headline cards, an insight line, and the table
 // scoring every effort. Renders nothing unless there are scored events.
-export default function RecoveryPanel({ rec }) {
+// `highlight` is the event number currently spotlighted on the HR chart, and
+// `onHover(n | null)` fires as the pointer moves over the table rows so the parent
+// can drive that spotlight.
+export default function RecoveryPanel({ rec, highlight = null, onHover }) {
   if (!rec || rec.error || !rec.events || !rec.events.length) return null;
   const ev = rec.events;
 
@@ -54,7 +57,7 @@ export default function RecoveryPanel({ rec }) {
   return (
     <div className="chart-wrap">
       <h2>Recovery <span className="rec-sub">
-        ⚡ {ev.length} event{ev.length > 1 ? "s" : ""} · resting {rec.resting} bpm · cyan line = recovery rate
+        ⚡ {ev.length} event{ev.length > 1 ? "s" : ""} · resting {rec.resting} bpm · cyan line = recovery rate · hover a row to spotlight it above
       </span></h2>
 
       <div className="cards">
@@ -66,7 +69,7 @@ export default function RecoveryPanel({ rec }) {
 
       <div className="rec-insight" dangerouslySetInnerHTML={{ __html: recoveryInsight(rec) }} />
 
-      <table className="rec">
+      <table className="rec" onMouseLeave={() => onHover?.(null)}>
         <thead>
           <tr>
             <th data-tip="Recovery event number, in order">#</th>
@@ -82,7 +85,9 @@ export default function RecoveryPanel({ rec }) {
         </thead>
         <tbody>
           {ev.map((e) => (
-            <tr key={e.n}>
+            <tr key={e.n}
+                className={highlight === e.n ? "hot" : undefined}
+                onMouseEnter={() => onHover?.(e.n)}>
               <td><span className="rec-pill">{e.n}</span></td>
               <td><b>{e.peak_bpm}</b></td>
               <td>{fmtElapsed(e.peak_t)}</td>
