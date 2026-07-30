@@ -39,6 +39,25 @@ RR_MAX_JUMP          = 0.20
 RMSSD_WIN_SEC        = 30.0
 RMSSD_MIN_BEATS      = 5
 
+# ── Initial recovery RATE (the "slope of the line") ───────────────────────────────
+# The single most intuitive recovery number: how many bpm your HR sheds per minute in
+# the crucial first stretch after the peak. It's the slope of a straight-line fit over
+# the first SLOPE_WIN_SEC of the fall (the steepest, most diagnostic part). Works for
+# every event — no exponential fit required — so it fills in where τ is rejected.
+# We need SLOPE_MIN_SEC of fall before quoting a per-minute rate: extrapolating a
+# 15-second dip to bpm/MINUTE invents a wildly steep number the body never sustained.
+SLOPE_WIN_SEC = 60.0
+SLOPE_MIN_SEC = 30.0
+
+# ── Quality grading (athlete-leaning; resting ≈ 53 bpm) ───────────────────────────
+# HRR60 is bpm shed in the first minute — the clinical recovery yardstick. Thresholds
+# nudged up from the clinical <12/12-20/>20 because this athlete recovers fast.
+HRR60_EXCELLENT = 30
+HRR60_GOOD      = 20
+HRR60_FAIR      = 12
+# Fatigue trend: flag when the recovery rate drifts this % across successive efforts.
+TREND_PCT       = 15
+
 # ── When a τ fit is trustworthy ───────────────────────────────────────────────────
 TAU_MIN_DUR   = 45.0
 TAU_MIN_DROP  = 6
@@ -142,6 +161,59 @@ def _fit_tau(t_rel, hr, resting):
     return float(tau) if r2 >= TAU_MIN_R2 and tau <= TAU_MAX_SEC else None
 
 
+def _initial_slope(d_t, d_hr):
+    """Initial recovery rate over the first minute, as (bpm_per_min, line).
+
+    A straight least-squares fit of HR against time over the first SLOPE_WIN_SEC of
+    the fall (or the whole fall if it's shorter). Returns the rate as a POSITIVE
+    bpm/min (bigger = faster recovery) plus the fitted line's endpoints so the chart
+    can draw the very slope we measured. (None, None) if there aren't two points."""
+    win = min(SLOPE_WIN_SEC, float(d_t[-1]))
+    if win < SLOPE_MIN_SEC:                  # too brief to quote a per-minute rate
+        return None, None
+    mask = d_t <= win + 1e-6
+    if mask.sum() < 2:
+        return None, None
+    tt, yy = d_t[mask], d_hr[mask]
+    if tt[-1] == tt[0]:
+        return None, None
+    m, b = np.polyfit(tt, yy, 1)            # bpm/sec (negative when falling), intercept
+    return float(-m * 60.0), (float(b), float(m * win + b), float(win))
+
+
+def _insights(events, resting):
+    """Session-level read on the per-event recoveries: best/avg rate, fatigue trend,
+    and a quality grade. None when nothing scored. Numbers only — the UI writes prose."""
+    rates = [e["slope"] for e in events if e.get("slope") is not None]
+    hrr60s = [e["hrr60"] for e in events if e.get("hrr60") is not None]
+    if not rates:
+        return None
+    rate_avg, rate_best = sum(rates) / len(rates), max(rates)
+    best_hrr = max(hrr60s) if hrr60s else None
+
+    # Fatigue: does the recovery rate drift across successive efforts? Fit a line to
+    # rate-vs-effort-order, then express the swing from the fitted first effort to the
+    # fitted last as a % of that first — so "slowed 40%" means exactly what it says.
+    # (Regression, not first-vs-last raw values, so one noisy effort can't dominate.)
+    trend, trend_pct = "steady", 0.0
+    if len(rates) >= 3:
+        m, b = np.polyfit(np.arange(len(rates), dtype=float), rates, 1)
+        first_fit, last_fit = float(b), float(b + m * (len(rates) - 1))
+        if first_fit > 0:
+            trend_pct = max(-99.0, min(200.0, (last_fit - first_fit) / first_fit * 100))
+            trend = "slowing" if trend_pct <= -TREND_PCT else \
+                    "improving" if trend_pct >= TREND_PCT else "steady"
+
+    quality = None
+    if best_hrr is not None:
+        quality = ("excellent" if best_hrr >= HRR60_EXCELLENT else
+                   "good"      if best_hrr >= HRR60_GOOD      else
+                   "fair"      if best_hrr >= HRR60_FAIR      else "sluggish")
+    return {"rate_avg": round(rate_avg, 1), "rate_best": round(rate_best, 1),
+            "trend": trend, "trend_pct": round(trend_pct),
+            "quality": quality, "best_hrr60": best_hrr, "n_scored": len(rates)}
+
+
 def _clean_rr(beats):
     kept = [(t, v) for t, v in beats if RR_MIN_MS <= v <= RR_MAX_MS]
     if not kept:
@@ -173,15 +245,16 @@ def analyze(hr, rr_beats, segments, resting=RESTING_HR_BPM):
     """
     if not hr:
         return {"resting": resting, "resting_rmssd": RESTING_RMSSD_MS,
-                "events": [], "overlay": {"peaks": [], "windows": [],
-                                          "decays": [], "decay_fitted": []}}
+                "events": [], "insights": None,
+                "overlay": {"peaks": [], "windows": [], "decays": [],
+                            "decay_fitted": [], "slopes": []}}
 
     hr_t = np.array([p["t"] for p in hr], dtype=float)
     bpm  = np.array([p["bpm"] for p in hr], dtype=float)
     rr_clean = _clean_rr([(t, v) for t, v in rr_beats])
     blocks = _effort_blocks(segments)
 
-    events, peaks, windows, decays, decay_fitted = [], [], [], [], []
+    events, peaks, windows, decays, decay_fitted, slopes = [], [], [], [], [], []
     for k, (b_start, b_end) in enumerate(blocks):
         lo, hi = b_end - PEAK_LOOKBACK, b_end + PEAK_LOOKAHEAD
         near = (hr_t >= lo) & (hr_t <= hi)
@@ -214,6 +287,7 @@ def analyze(hr, rr_beats, segments, resting=RESTING_HR_BPM):
             s_end = s_peak_t + dur
 
             tau = _fit_tau(d_t, d_hr, resting)
+            rate, slope_line = _initial_slope(d_t, d_hr)
 
             def drop(sec, _pt=s_peak_t, _pb=s_peak_bpm, _end=s_end):
                 v = _hr_at(hr_t, bpm, _pt + sec)
@@ -234,12 +308,23 @@ def analyze(hr, rr_beats, segments, resting=RESTING_HR_BPM):
             events.append({
                 "n": n, "peak_bpm": round(s_peak_bpm), "peak_t": round(s_peak_t, 1),
                 "dur": round(dur), "hrr60": hrr60, "hrr120": hrr120,
+                "slope": round(rate, 1) if rate is not None else None,
                 "tau": round(tau) if tau else None,
                 "to_base": to_base, "reached": reached,
                 "rmssd60": round(rmssd60) if rmssd60 else None,
             })
             peaks.append({"n": n, "t": round(s_peak_t, 1), "bpm": round(s_peak_bpm)})
             windows.append({"n": n, "t0": round(s_peak_t, 1), "t1": round(s_end, 1)})
+
+            # The initial-rate line — the literal slope we report in bpm/min, drawn
+            # straight from the peak across the first minute of the fall.
+            if slope_line is not None:
+                b0, b1, win = slope_line
+                slopes.append({"n": n, "rate": round(rate, 1),
+                               "t0": round(s_peak_t, 1), "bpm0": round(b0, 1),
+                               "t1": round(s_peak_t + win, 1), "bpm1": round(b1, 1)})
+            else:
+                slopes.append(None)
 
             # Decay line: fitted exponential when τ is trustworthy, else a straight
             # peak→low guide (both span this fall only; every kept fall draws one).
@@ -256,7 +341,7 @@ def analyze(hr, rr_beats, segments, resting=RESTING_HR_BPM):
 
     return {
         "resting": resting, "resting_rmssd": RESTING_RMSSD_MS,
-        "events": events,
-        "overlay": {"peaks": peaks, "windows": windows,
-                    "decays": decays, "decay_fitted": decay_fitted},
+        "events": events, "insights": _insights(events, resting),
+        "overlay": {"peaks": peaks, "windows": windows, "decays": decays,
+                    "decay_fitted": decay_fitted, "slopes": slopes},
     }

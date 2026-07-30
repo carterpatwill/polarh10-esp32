@@ -118,6 +118,16 @@
   table.rec th { text-align: right; color: var(--muted); font-weight: 600; font-size: 10px;
                  text-transform: uppercase; letter-spacing: .5px; padding: 6px 10px;
                  border-bottom: 1px solid var(--line); }
+  table.rec th[data-tip] { cursor: help; text-decoration: underline dotted;
+                           text-underline-offset: 3px; text-decoration-color: var(--muted); }
+  /* custom hover tooltip (native title= is slow/unreliable) */
+  #tip { position: fixed; z-index: 1000; max-width: 260px; background: #1a2233;
+         color: var(--text); border: 1px solid var(--line); border-radius: 8px;
+         padding: 8px 11px; font-size: 12px; line-height: 1.45; font-weight: 400;
+         text-transform: none; letter-spacing: 0; pointer-events: none;
+         box-shadow: 0 8px 24px rgba(0,0,0,.45); opacity: 0; transition: opacity .1s;
+         transform: translateX(-50%); }
+  #tip.show { opacity: 1; }
   table.rec td { text-align: right; padding: 7px 10px; border-bottom: 1px solid #1a2233; }
   table.rec th:first-child, table.rec td:first-child { text-align: left; }
   table.rec td b { font-weight: 700; }
@@ -125,6 +135,13 @@
   .rec-pill { display: inline-flex; align-items: center; justify-content: center;
               width: 20px; height: 20px; border-radius: 50%; background: #f85149;
               color: #0d1117; font-weight: 700; font-size: 11px; }
+  .rec-insight { font-size: 13.5px; line-height: 1.55; color: var(--muted);
+                 background: var(--bg); border: 1px solid var(--line);
+                 border-left: 3px solid #39d0d8; border-radius: 8px;
+                 padding: 11px 14px; margin: 12px 0 4px; }
+  .rec-insight:empty { display: none; }
+  .rec-insight b { color: var(--text); font-weight: 700; }
+  .card .v small { font-size: 12px; color: var(--muted); font-weight: 500; }
 </style>
 </head>
 <body>
@@ -170,6 +187,7 @@
     <div class="chart-wrap" id="recWrap" style="display:none">
       <h2>Recovery <span class="rec-sub" id="recHint"></span></h2>
       <div class="cards" id="recCards"></div>
+      <div class="rec-insight" id="recInsight"></div>
       <div id="recTable"></div>
     </div>
   </section>
@@ -424,6 +442,16 @@ const recoveryOverlay = {
       ctx.stroke();
     });
     ctx.setLineDash([]);
+    // initial recovery RATE: a straight cyan line = the bpm/min slope we report,
+    // laid over the first minute of the fall so you can see the speed you're graded on.
+    ctx.globalAlpha = 0.95; ctx.strokeStyle = "#39d0d8"; ctx.lineWidth = 2.2;
+    for (const s of (rec.overlay.slopes || [])) {
+      if (!s) continue;
+      ctx.beginPath();
+      ctx.moveTo(xs.getPixelForValue(s.t0), ys.getPixelForValue(s.bpm0));
+      ctx.lineTo(xs.getPixelForValue(s.t1), ys.getPixelForValue(s.bpm1));
+      ctx.stroke();
+    }
     // peak dots + numbers
     ctx.font = "700 10px -apple-system, sans-serif";
     ctx.textAlign = "center"; ctx.textBaseline = "bottom";
@@ -545,6 +573,39 @@ async function loadDetail(sid) {
   loadRecovery(d.id);   // per-effort HR recovery + overlay (async)
 }
 
+// Turn the session-level insights numbers into a plain-English read on recovery.
+function recoveryInsight(d) {
+  const ins = d.insights;
+  if (!ins) return "";
+  const parts = [];
+
+  // Speed + grade — the headline the user actually cares about.
+  if (ins.quality) {
+    const tint = { excellent: "#3fb950", good: "#3fb950",
+                   fair: "#d29922", sluggish: "#f85149" }[ins.quality] || "#e6edf3";
+    parts.push(`Fastest recovery <b>${ins.rate_best} bpm/min</b> `
+      + `(HRR60 ${ins.best_hrr60} bpm) — <b style="color:${tint}">${ins.quality}</b> `
+      + `for a resting HR of ${d.resting}.`);
+  } else {
+    parts.push(`Fastest recovery <b>${ins.rate_best} bpm/min</b>.`);
+  }
+
+  // Fatigue trend across the session's efforts.
+  if (ins.n_scored >= 3) {
+    const swing = Math.abs(ins.trend_pct);
+    if (ins.trend === "slowing")
+      parts.push(`Recovery <b style="color:#f85149">slowed ${swing}%</b> from the first `
+        + `effort to the last — a sign of accumulating fatigue.`);
+    else if (ins.trend === "improving")
+      parts.push(`Recovery <b style="color:#3fb950">sped up ${swing}%</b> across the session `
+        + `— you warmed into it.`);
+    else
+      parts.push(`Recovery rate held <b>steady</b> across all ${ins.n_scored} efforts `
+        + `— no fatigue drop-off.`);
+  }
+  return parts.join(" ");
+}
+
 // Fetch per-effort recovery: overlay the HR chart and fill the recovery section.
 async function loadRecovery(sid) {
   const wrap = document.getElementById("recWrap");
@@ -559,20 +620,25 @@ async function loadRecovery(sid) {
   if (hrChart) { hrChart.$recovery = d; hrChart.update(); }   // draw peaks/windows/decay
 
   document.getElementById("recHint").textContent =
-    `⚡ ${d.events.length} event${d.events.length > 1 ? "s" : ""} · resting ${d.resting} bpm`;
+    `⚡ ${d.events.length} event${d.events.length > 1 ? "s" : ""} · resting ${d.resting} bpm`
+    + ` · cyan line = recovery rate`;
 
   // Headline cards — best of each metric across the session's efforts.
   const ev = d.events;
   const bestOf = (key, cmp) => ev.map(e => e[key]).filter(v => v != null)
                                  .reduce((a, b) => cmp(a, b), null);
+  const fastRate = bestOf("slope",   (a, b) => a == null ? b : Math.max(a, b));
   const best60  = bestOf("hrr60",   (a, b) => a == null ? b : Math.max(a, b));
   const fastTau = bestOf("tau",     (a, b) => a == null ? b : Math.min(a, b));
   const bestHrv = bestOf("rmssd60", (a, b) => a == null ? b : Math.max(a, b));
   const card = (k, v) => `<div class="card"><div class="k">${k}</div><div class="v">${v}</div></div>`;
   document.getElementById("recCards").innerHTML =
+    card("Recovery rate", fastRate != null ? fastRate + " <small>bpm/min</small>" : "–") +
     card("Best HRR60", best60 != null ? best60 + " bpm" : "–") +
     card("Fastest τ",  fastTau != null ? fastTau + " s" : "–") +
     card("HRV rebound", bestHrv != null ? bestHrv + " ms" : "–");
+
+  document.getElementById("recInsight").innerHTML = recoveryInsight(d);
 
   // Per-event table — every effort scored on its own row.
   const cell = (v, suf = "") => v == null ? '<span class="dim">–</span>' : v + suf;
@@ -583,6 +649,7 @@ async function loadRecovery(sid) {
       <td><span class="rec-pill">${e.n}</span></td>
       <td><b>${e.peak_bpm}</b></td>
       <td>${fmtElapsed(e.peak_t)}</td>
+      <td><b style="color:#39d0d8">${cell(e.slope)}</b></td>
       <td>${cell(e.hrr60)}</td>
       <td>${cell(e.hrr120)}</td>
       <td>${cell(e.tau, " s")}</td>
@@ -593,8 +660,15 @@ async function loadRecovery(sid) {
   document.getElementById("recTable").innerHTML = `
     <table class="rec">
       <thead><tr>
-        <th>#</th><th>peak</th><th>@time</th><th>HRR60</th>
-        <th>HRR120</th><th>τ</th><th>to base</th><th>RMSSD@60</th>
+        <th data-tip="Recovery event number, in order">#</th>
+        <th data-tip="Highest heart rate at the start of this recovery (bpm).">peak</th>
+        <th data-tip="When this effort peaked — elapsed time into the session.">@time</th>
+        <th data-tip="Initial recovery rate — how fast HR fell over the first minute (bpm per minute). Bigger = faster recovery.">rate</th>
+        <th data-tip="Heart rate difference after 60 seconds — how many bpm HR dropped in the first minute after the peak. The clinical fitness standard.">HRR60</th>
+        <th data-tip="Heart rate difference after 120 seconds — bpm dropped in the first two minutes after the peak.">HRR120</th>
+        <th data-tip="Tau (τ): the time constant of the exponential decay HR settles along. Smaller = faster recovery.">τ</th>
+        <th data-tip="Time until HR fell back within 10 bpm of your resting HR. A '>' means it never got there in the window.">to base</th>
+        <th data-tip="RMSSD ~60s after the peak — heart-rate variability (ms). Crushed by effort, it climbs back toward your resting ~59 ms as you recover.">RMSSD@60</th>
       </tr></thead>
       <tbody>${rows}</tbody>
     </table>`;
@@ -617,6 +691,23 @@ function route() {
     loadList(tab);
   }
 }
+
+// ---------- custom hover tooltips (any element with data-tip) ----------
+const _tip = document.createElement("div");
+_tip.id = "tip";
+document.body.appendChild(_tip);
+document.addEventListener("mouseover", e => {
+  const el = e.target.closest("[data-tip]");
+  if (!el) return;
+  _tip.textContent = el.getAttribute("data-tip");
+  const r = el.getBoundingClientRect();
+  _tip.style.left = Math.round(r.left + r.width / 2) + "px";
+  _tip.style.top  = Math.round(r.bottom + 8) + "px";
+  _tip.classList.add("show");
+});
+document.addEventListener("mouseout", e => {
+  if (e.target.closest("[data-tip]")) _tip.classList.remove("show");
+});
 
 window.addEventListener("hashchange", route);
 route();
