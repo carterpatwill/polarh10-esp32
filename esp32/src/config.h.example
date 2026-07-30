@@ -9,13 +9,21 @@
 // serve the stored session files over a small web page on your LAN.
 
 // ── WiFi — used ONLY in sync mode to offload recordings ──────────────────────
-// When you plug the board into USB it joins this network, prints its URL to the
-// serial monitor, and serves the recorded sessions. Two networks are tried in
-// order so you can offload at home or somewhere else.
+// When you plug the board into USB it brings WiFi up and pushes the stored
+// recordings. Networks are tried in order: eduroam (WPA2-Enterprise) first, then
+// the plain-WPA2 personal networks below.
 #define SYNC_SSID       "YOUR_WIFI_SSID"
 #define SYNC_PASS       "YOUR_WIFI_PASSWORD"
 #define SYNC_SSID2      "YOUR_SECOND_WIFI_SSID"
 #define SYNC_PASS2      "YOUR_SECOND_WIFI_PASSWORD"
+
+// ── WiFi — WPA2-Enterprise / eduroam (tried FIRST for the dump) ───────────────
+// PEAP/TTLS with a username + password (not a pre-shared key). ENT_IDENTITY is
+// the outer/anonymous identity; for eduroam it's usually the same as ENT_USER.
+#define ENT_SSID        "eduroam"
+#define ENT_IDENTITY    "you@your-school.edu"
+#define ENT_USER        "you@your-school.edu"
+#define ENT_PASS        "YOUR_ENTERPRISE_PASSWORD"
 
 // ── Board pins — Seeed Studio XIAO ESP32-S3 ──────────────────────────────────
 // Onboard user LED is GPIO21 and is ACTIVE-LOW (driving LOW lights it):

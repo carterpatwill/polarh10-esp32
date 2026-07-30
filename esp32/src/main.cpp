@@ -23,8 +23,10 @@
 #include <NimBLEDevice.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <esp_eap_client.h>            // WPA2-Enterprise (eduroam) join
 #include <PubSubClient.h>
 #include <LittleFS.h>
+#include <time.h>                       // NTP time for reconstructing session start
 #include "soc/soc.h"                    // REG_READ
 #include "soc/usb_serial_jtag_reg.h"    // USB-Serial-JTAG SOF frame counter
 #include "config.h"
@@ -155,13 +157,16 @@ static void openSession() {
         if (accFile) accFile.close();
         return;
     }
+    // Record the open time so sync can reconstruct the wall-clock start: the board
+    // has no RTC, but at sync it has NTP + millis(), and now = start + elapsed.
+    sessionStart_ms = millis();
+    hrFile.printf("# start_ms=%lu\n", (unsigned long)sessionStart_ms);
     hrFile.println("t_ms,bpm,rr_ms");
     accFile.printf("# sample_rate_hz=%d range_g=%d\n", ACC_SAMPLE_RATE, ACC_RANGE_G);
     accFile.println("t_ms,x,y,z");
     hrFile.flush();
     accFile.flush();
     sessionActive   = true;
-    sessionStart_ms = millis();
     flashFull       = false;
     Serial.printf("[REC] Session %04u opened\n", sessionNum);
 }
@@ -515,18 +520,30 @@ static bool mqttConnect() {
 }
 
 // Publish a session start/stop marker so the Pi opens/closes a session row and
-// tags the data that follows. `label` (may be nullptr) names the session.
-static bool publishSession(const char* action, const char* label) {
+// tags the data that follows. `label` (may be nullptr) names the session;
+// `startedEpoch` (0 = unknown) is the reconstructed wall-clock start in Unix time.
+static bool publishSession(const char* action, const char* label, long startedEpoch = 0) {
     String s = "{\"action\":\""; s += action; s += "\"";
     if (label && label[0]) { s += ",\"label\":\""; s += label; s += "\""; }
+    if (startedEpoch > 0)  { s += ",\"started_epoch\":"; s += String(startedEpoch); }
     s += "}";
     return mqtt.publish(MQTT_TOPIC_SESSION, s.c_str());
+}
+
+// Pull the "# start_ms=NNN" marker written into an HR file's header at session
+// open. Returns 0 if the file or marker is missing (older recordings).
+static uint32_t readSessionStartMs(const char* hrPath) {
+    File f = LittleFS.open(hrPath, FILE_READ);
+    if (!f) return 0;
+    String line = f.readStringUntil('\n');
+    f.close();
+    int p = line.indexOf("start_ms=");
+    return (p < 0) ? 0 : (uint32_t)strtoul(line.c_str() + p + 9, nullptr, 10);
 }
 
 // Replay one HR CSV (t_ms,bpm,rr_ms) as batched polar/hr messages. The Pi expects
 // {"readings":[{"t_ms":..,"bpm":..,"rr_ms":[..]}, ...]}.
 static bool uploadHrFile(File& f) {
-    f.readStringUntil('\n');   // skip the "t_ms,bpm,rr_ms" header
     String batch; int n = 0;
     auto flush = [&]() -> bool {
         if (n == 0) return true;
@@ -537,7 +554,7 @@ static bool uploadHrFile(File& f) {
     };
     while (f.available()) {
         String line = f.readStringUntil('\n'); line.trim();
-        if (line.length() == 0) continue;
+        if (line.length() == 0 || line.startsWith("#") || line.startsWith("t")) continue;
         int c1 = line.indexOf(',');
         int c2 = line.indexOf(',', c1 + 1);
         if (c1 < 0) continue;
@@ -583,19 +600,29 @@ static bool uploadAccFile(File& f) {
 // Upload one session (both CSVs) to the Pi, then delete the files on success. A
 // failed upload leaves the files in place so the next plug-in retries.
 static void uploadSession(uint16_t num) {
-    char hrPath[24], accPath[24], label[8];
+    char hrPath[24], accPath[24];
     snprintf(hrPath,  sizeof(hrPath),  "/s%04u_hr.csv",  num);
     snprintf(accPath, sizeof(accPath), "/s%04u_acc.csv", num);
-    snprintf(label,   sizeof(label),   "s%04u", num);
 
     bool haveHr  = LittleFS.exists(hrPath);
     bool haveAcc = LittleFS.exists(accPath);
     if (!haveHr && !haveAcc) return;
 
+    // Reconstruct the wall-clock start from NTP: start = now − (how long ago it
+    // opened). Needs a valid NTP time and no reboot since recording (a reboot
+    // resets millis() below the stored value); otherwise send 0 and let the Pi
+    // fall back to sync-receipt time.
+    long startedEpoch = 0;
+    time_t nowEpoch   = time(nullptr);
+    uint32_t startMs  = readSessionStartMs(hrPath);
+    if (nowEpoch > 1700000000L && startMs != 0 && startMs <= millis())
+        startedEpoch = (long)nowEpoch - (long)((millis() - startMs) / 1000UL);
+
     Serial.printf("[SYNC] Uploading session %04u...\n", num);
     if (!mqttConnect()) { Serial.println("[SYNC] MQTT not connected — aborting"); return; }
 
-    if (!publishSession("start", label)) { Serial.println("[SYNC] session start failed"); return; }
+    // No label: the dashboard names the session by its start time until you rename it.
+    if (!publishSession("start", nullptr, startedEpoch)) { Serial.println("[SYNC] session start failed"); return; }
     delay(250); mqtt.loop();
 
     bool ok = true;
@@ -642,6 +669,42 @@ static void runUploads() {
     Serial.println("[SYNC] Upload pass complete");
 }
 
+// Fast-blink the LED while we wait for an association so a plug-in shows activity
+// immediately (this runs before the loop's updateStatusLed() takes over). Returns
+// true once connected, false after `timeoutMs`.
+static bool waitForWifi(uint32_t timeoutMs) {
+    static bool ledPhase = false;
+    uint32_t t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < timeoutMs) {
+        delay(150); Serial.print('.');
+        ledPhase = !ledPhase; digitalWrite(PIN_BL, ledPhase ? LOW : HIGH);
+    }
+    return WiFi.status() == WL_CONNECTED;
+}
+
+// Join a WPA2-Enterprise network (eduroam: PEAP/TTLS with username + password).
+// Credentials live in config.h (ENT_*). On failure we disable enterprise mode so
+// the plain-WPA2 fallbacks that follow aren't left in an enterprise config.
+static bool joinEnterprise(uint32_t timeoutMs) {
+    Serial.printf("[SYNC] Joining WPA2-Enterprise '%s' as %s", ENT_SSID, ENT_IDENTITY);
+    WiFi.disconnect(true);
+    esp_eap_client_set_identity((const uint8_t*)ENT_IDENTITY, strlen(ENT_IDENTITY));
+    esp_eap_client_set_username((const uint8_t*)ENT_USER, strlen(ENT_USER));
+    esp_eap_client_set_password((const uint8_t*)ENT_PASS, strlen(ENT_PASS));
+    esp_wifi_sta_enterprise_enable();
+    WiFi.begin(ENT_SSID);
+    if (waitForWifi(timeoutMs)) return true;
+    esp_wifi_sta_enterprise_disable();
+    return false;
+}
+
+// Join a plain WPA2-PSK network.
+static bool joinWpa2(const char* ssid, const char* pass, uint32_t timeoutMs) {
+    Serial.printf("\n[SYNC] Trying WiFi '%s'", ssid);
+    WiFi.begin(ssid, pass);
+    return waitForWifi(timeoutMs);
+}
+
 static void enterSyncMode() {
     Serial.println("\n[SYNC] USB detected — entering sync mode");
     // Stop recording: close any open session and drop the strap so BLE is idle.
@@ -652,34 +715,27 @@ static void enterSyncMode() {
 
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);
-    // Fast-blink the LED while we search for WiFi so a plug-in shows activity
-    // immediately (this join runs before the loop's updateStatusLed() takes over).
-    bool ledPhase = false;
-    Serial.printf("[SYNC] Joining WiFi '%s'", SYNC_SSID);
-    WiFi.begin(SYNC_SSID, SYNC_PASS);
-    uint32_t t0 = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) {
-        delay(150); Serial.print('.');
-        ledPhase = !ledPhase; digitalWrite(PIN_BL, ledPhase ? LOW : HIGH);
-    }
-    if (WiFi.status() != WL_CONNECTED) {
-        Serial.printf("\n[SYNC] Trying WiFi '%s'", SYNC_SSID2);
-        WiFi.begin(SYNC_SSID2, SYNC_PASS2);
-        t0 = millis();
-        while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) {
-            delay(150); Serial.print('.');
-            ledPhase = !ledPhase; digitalWrite(PIN_BL, ledPhase ? LOW : HIGH);
-        }
-    }
-    if (WiFi.status() == WL_CONNECTED) {
+    // eduroam (WPA2-Enterprise) is tried first for the dump, then the personal
+    // WPA2 networks as fallbacks.
+    bool joined = joinEnterprise(15000)
+               || joinWpa2(SYNC_SSID,  SYNC_PASS,  10000)
+               || joinWpa2(SYNC_SSID2, SYNC_PASS2, 10000);
+
+    if (joined) {
         Serial.printf("\n[SYNC] WiFi up, IP %s — pushing recordings to the Pi\n",
                       WiFi.localIP().toString().c_str());
+        // Grab NTP time so each session's real start can be reconstructed from millis().
+        // UTC epoch (offset 0); the Pi renders it in local time. Wait briefly for a fix.
+        configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+        struct tm tmNow;
+        for (int i = 0; i < 20 && !getLocalTime(&tmNow, 200); i++) { /* up to ~4s */ }
+        Serial.printf("[SYNC] NTP time: %ld\n", (long)time(nullptr));
         secureClient.setInsecure();          // HiveMQ TLS; no cert pinning (matches old build)
         mqtt.setServer(MQTT_HOST, MQTT_PORT);
         mqtt.setBufferSize(8192);            // batches are large; PubSubClient defaults to 256
         mqttConnect();
     } else {
-        Serial.println("\n[SYNC] WiFi failed — check SYNC_SSID/PASS in config.h");
+        Serial.println("\n[SYNC] WiFi failed — check ENT_*/SYNC_SSID/PASS in config.h");
     }
 
     syncUploaded = false;   // the loop runs one upload pass once the link is up

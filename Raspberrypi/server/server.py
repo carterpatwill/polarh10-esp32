@@ -119,11 +119,18 @@ def handle_session(data, received):
     with sqlite3.connect(DB_PATH) as conn:
         if action == "start":
             label = (data.get("label") or "").strip() or None
+            # The ESP (BLE-only sync) sends the reconstructed real start time as a Unix
+            # epoch; render it in local time to match `received`. Absent/bogus → sync time.
+            epoch = data.get("started_epoch")
+            try:
+                started = datetime.fromtimestamp(epoch).isoformat(timespec="seconds") if epoch else received
+            except (TypeError, ValueError, OSError, OverflowError):
+                started = received
             cur = conn.execute("INSERT INTO sessions (started, label, kind) VALUES (?, ?, ?)",
-                               (received, label, pending_kind))
+                               (started, label, pending_kind))
             conn.commit()
             current_session_id = cur.lastrowid
-            print(f"[session] START → id={current_session_id} at {received}"
+            print(f"[session] START → id={current_session_id} at {started}"
                   + f"  kind={pending_kind}"
                   + (f"  label={label!r}" if label else ""))
         elif action == "stop":

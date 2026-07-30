@@ -95,6 +95,14 @@ def one(sql, args=()):
     return rows[0] if rows else None
 
 
+def _write(sql, args=()):
+    """Run a write against the same DB (used only to rename sessions). Opens
+    read-write briefly; the receiver tolerates the concurrent access."""
+    with sqlite3.connect(DB_PATH, timeout=5) as conn:
+        conn.execute(sql, args)
+        conn.commit()
+
+
 def _table_columns(table):
     """Column names of a table, or empty set if the DB/table isn't there yet."""
     return {r["name"] for r in q(f"PRAGMA table_info({table})")}
@@ -223,6 +231,37 @@ def session_detail(sid):
         "acc_total": acc_n,
         "stats": stats,
     })
+
+
+@app.route("/api/session/<int:sid>/name", methods=["POST"])
+def rename_session(sid):
+    """Set (or clear) a session's custom name. Empty name reverts to the
+    date/time default shown by the UI."""
+    if not one("SELECT id FROM sessions WHERE id = ?", (sid,)):
+        return jsonify({"error": "no such session"}), 404
+    name = (request.get_json(silent=True) or {}).get("name", "")
+    name = name.strip() or None
+    try:
+        _write("UPDATE sessions SET label = ? WHERE id = ?", (name, sid))
+    except sqlite3.OperationalError as e:
+        return jsonify({"error": f"could not save: {e}"}), 500
+    return jsonify({"ok": True, "label": name})
+
+
+@app.route("/api/session/<int:sid>", methods=["DELETE"])
+def delete_session(sid):
+    """Permanently remove a session and all of its HR/ACC readings. Used to clear
+    out the near-empty bounce artifacts and duplicate uploads (see the s0001…
+    phantom sessions from the filename-labeled firmware)."""
+    if not one("SELECT id FROM sessions WHERE id = ?", (sid,)):
+        return jsonify({"error": "no such session"}), 404
+    try:
+        _write("DELETE FROM hr WHERE session = ?", (sid,))
+        _write("DELETE FROM acc WHERE session = ?", (sid,))
+        _write("DELETE FROM sessions WHERE id = ?", (sid,))
+    except sqlite3.OperationalError as e:
+        return jsonify({"error": f"could not delete: {e}"}), 500
+    return jsonify({"ok": True})
 
 
 def _load_acc_samples(sid):

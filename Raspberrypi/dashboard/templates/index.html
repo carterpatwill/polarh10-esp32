@@ -69,9 +69,25 @@
   .session .chev { color: var(--muted); font-size: 20px; }
   .empty { color: var(--muted); padding: 40px 0; text-align: center; }
 
+  /* ---- per-row actions (rename / delete) ---- */
+  .session .actions { display: flex; gap: 6px; }
+  .row-btn { font-size: 13px; line-height: 1; color: var(--muted); background: var(--bg);
+             border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px;
+             cursor: pointer; opacity: 0; transition: opacity .12s, border-color .12s, color .12s; }
+  .session:hover .row-btn { opacity: 1; }
+  .row-btn:hover { color: #fff; border-color: var(--blue); }
+  .row-btn.del:hover { color: var(--red); border-color: var(--red); }
+  /* touch devices have no hover, so always show the buttons there */
+  @media (hover: none) { .row-btn { opacity: 1; } }
+
   /* ---- detail ---- */
   .back { display: inline-flex; align-items: center; gap: 6px; margin-bottom: 14px;
           font-size: 14px; cursor: pointer; }
+  .rename-btn { margin-left: 12px; vertical-align: middle; font-size: 12px; font-weight: 600;
+                color: var(--muted); background: var(--panel); border: 1px solid var(--line);
+                border-radius: 8px; padding: 4px 10px; cursor: pointer; }
+  .rename-btn:hover { color: #fff; border-color: var(--blue); }
+  .rename-btn.del:hover { color: var(--red); border-color: var(--red); }
   .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 10px; margin-bottom: 16px; }
   .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
   .card .k { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .5px; }
@@ -183,6 +199,15 @@ function fmtDate(iso) {
 function fmtTime(iso) {
   return new Date(iso).toLocaleTimeString([], { hour:"2-digit", minute:"2-digit" });
 }
+// Compact date + time, e.g. "7/28/26, 7:47 PM" — the default session name.
+function fmtDateTime(iso) {
+  return new Date(iso).toLocaleString([], {
+    month:"numeric", day:"numeric", year:"2-digit", hour:"numeric", minute:"2-digit" });
+}
+// The name to show for a session: the user's custom label, else its start date/time.
+function sessionName(s) {
+  return s.label ? escapeHtml(s.label) : fmtDateTime(s.started);
+}
 function dayKey(iso) { return iso.slice(0, 10); }  // YYYY-MM-DD
 
 // ---------- list view ----------
@@ -193,12 +218,18 @@ function renderSession(s, badge = "") {
   return `
     <div class="session" onclick="location.hash='#/session/${s.id}'">
       <div class="grow">
-        <div class="label">${s.label ? escapeHtml(s.label) : "Session #" + s.id} ${badge}</div>
-        <div class="when">${fmtTime(s.started)} · ${fmtDur(s.duration_s)}</div>
+        <div class="label">${sessionName(s)} ${badge}</div>
+        <div class="when">${fmtDate(s.started)} · ${fmtTime(s.started)} · ${fmtDur(s.duration_s)}</div>
       </div>
       <div class="metrics">
         <div class="metric"><div class="v">${s.hr_count.toLocaleString()}</div><div class="k">HR</div></div>
         <div class="metric"><div class="v">${s.acc_count.toLocaleString()}</div><div class="k">Acc</div></div>
+      </div>
+      <div class="actions">
+        <button class="row-btn" title="Rename"
+                onclick="event.stopPropagation();renameSession(${s.id})">✏️</button>
+        <button class="row-btn del" title="Delete"
+                onclick="event.stopPropagation();deleteSession(${s.id})">🗑</button>
       </div>
       <span class="chev">›</span>
     </div>`;
@@ -237,6 +268,10 @@ function renderWorkouts(workouts) {
   return `<div class="area">${body}</div>`;
 }
 
+// Sessions currently shown in the list, keyed by id — lets the row rename/delete
+// buttons read a session's label/start without another round-trip.
+const sessionsById = {};
+
 async function loadList(tab) {
   const box = document.getElementById("sessionList");
   // Mark the active tab immediately so the click feels responsive.
@@ -250,6 +285,8 @@ async function loadList(tab) {
     box.innerHTML = `<div class="empty">Couldn't load sessions: ${e.message}</div>`;
     return;
   }
+  for (const k in sessionsById) delete sessionsById[k];
+  for (const s of sessions) sessionsById[s.id] = s;
   // Training data (kind='train') has its own tab; everything else is a workout.
   const training = sessions.filter(s => s.kind === "train");
   const workouts = sessions.filter(s => s.kind !== "train");
@@ -261,6 +298,56 @@ async function loadList(tab) {
 
 function escapeHtml(s) {
   return s.replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+}
+
+// Look up a session for the row/detail action buttons: prefer the list cache,
+// fall back to the open detail view.
+function sessionFor(id) {
+  return sessionsById[id] || (currentSession && currentSession.id === id ? currentSession : null);
+}
+
+// After a rename/delete: refresh the detail view if it's open on this session,
+// otherwise re-render the list.
+function refreshAfterMutation() {
+  route();
+}
+
+// Rename a session by id — works from both the list rows and the detail view.
+async function renameSession(id) {
+  const s = sessionFor(id);
+  const cur = (s && s.label) || (s ? fmtDateTime(s.started) : "");
+  const name = prompt("Name this session (leave blank to use the date/time):", cur);
+  if (name === null) return;   // cancelled
+  try {
+    const r = await fetch(`/api/session/${id}/name`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    const res = await r.json();
+    if (!r.ok) throw new Error(res.error || "save failed");
+    if (location.hash === "#/session/" + id) loadDetail(id);   // refresh title
+    else refreshAfterMutation();                               // refresh list row
+  } catch (e) {
+    alert("Couldn't rename: " + e.message);
+  }
+}
+
+// Delete a session (and all its HR/ACC data) by id, after confirming.
+async function deleteSession(id) {
+  const s = sessionFor(id);
+  const nm = s ? (s.label || fmtDateTime(s.started)) : ("#" + id);
+  if (!confirm(`Delete "${nm}"?\n\nThis permanently removes the session and all of its heart-rate and accelerometer data. This can't be undone.`))
+    return;
+  try {
+    const r = await fetch(`/api/session/${id}`, { method: "DELETE" });
+    const res = await r.json();
+    if (!r.ok) throw new Error(res.error || "delete failed");
+    if (location.hash === "#/session/" + id) location.hash = "";  // leave the gone session
+    else refreshAfterMutation();                                  // drop the row from the list
+  } catch (e) {
+    alert("Couldn't delete: " + e.message);
+  }
 }
 
 // ---------- detail view ----------
@@ -414,16 +501,21 @@ async function loadActivity(sid) {
       </span>`).join("");
 }
 
+let currentSession = null;   // {id, label, started} for the open detail view (rename/delete target)
+
 async function loadDetail(sid) {
   const d = await fetch("/api/session/" + sid).then(r => r.json());
   if (d.error) { document.getElementById("dTitle").textContent = "Session not found"; return; }
 
+  currentSession = { id: d.id, label: d.label, started: d.started };
   const badge = d.kind === "train"
     ? ` <span class="badge ${d.bucket || "other"}">training · ${d.bucket || "other"}</span>`
     : "";
   document.getElementById("dTitle").innerHTML =
-    escapeHtml(d.label || "Session #" + d.id) + badge +
-    "  ·  " + fmtDate(d.started) + " " + fmtTime(d.started);
+    sessionName(d) + badge +
+    "  ·  " + fmtDate(d.started) + " " + fmtTime(d.started) +
+    ` <button class="rename-btn" onclick="renameSession(${d.id})" title="Rename this session">✏️ Rename</button>` +
+    ` <button class="rename-btn del" onclick="deleteSession(${d.id})" title="Delete this session">🗑 Delete</button>`;
   const st = d.stats || {};
   document.getElementById("dDur").textContent = fmtDur(d.duration_s);
   document.getElementById("dAvg").textContent = st.avg ?? "–";
