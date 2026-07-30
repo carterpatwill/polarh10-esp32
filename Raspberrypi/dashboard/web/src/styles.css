@@ -86,6 +86,31 @@ h1 .sub { color: var(--muted); font-weight: 400; font-size: 13px; }
 .card .k { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .5px; }
 .card .v { font-size: 22px; font-weight: 700; margin-top: 4px; }
 .card .v small { font-size: 12px; color: var(--muted); font-weight: 500; }
+/* ---- heart-rate tab: BPM trio grouped, counts demoted to a footnote ---- */
+.bpm-panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+             padding: 16px 18px; margin-bottom: 10px; }
+.bpm-panel .cap { color: var(--muted); font-size: 10px; text-transform: uppercase;
+                  letter-spacing: .6px; font-weight: 600; margin-bottom: 18px; }
+/* range bar: min on the left, max on the right, avg dot along the track */
+.bpm-range { display: flex; align-items: center; gap: 18px; }
+.bpm-range .end { text-align: center; min-width: 42px; }
+.bpm-range .end .n { font-size: 26px; font-weight: 700; line-height: 1; }
+.bpm-range .end .l { color: var(--muted); font-size: 10px; text-transform: uppercase;
+                     letter-spacing: .5px; margin-top: 6px; }
+.bpm-range .track { position: relative; flex: 1; height: 34px; }
+.bpm-range .bar { position: absolute; top: 50%; left: 0; right: 0; height: 5px;
+                  transform: translateY(-50%); border-radius: 999px; background: var(--line); }
+.bpm-range .marker { position: absolute; top: 50%; transform: translate(-50%, -50%); }
+.bpm-range .marker .dot { width: 15px; height: 15px; border-radius: 50%;
+                          background: var(--text); border: 3px solid var(--panel);
+                          box-shadow: 0 0 0 1px var(--line); }
+.bpm-range .marker .avg { position: absolute; bottom: 16px; left: 50%; transform: translateX(-50%);
+                          white-space: nowrap; font-size: 13px; font-weight: 700; }
+.bpm-range .marker .avg span { color: var(--muted); font-weight: 400; font-size: 10px;
+                               text-transform: uppercase; letter-spacing: .5px; }
+.hr-meta { color: var(--muted); font-size: 12px; margin: 0 0 16px 2px; }
+.hr-meta b { color: var(--text); font-weight: 600; }
+
 .chart-wrap { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; margin-bottom: 16px; }
 .chart-wrap h2 { font-size: 13px; margin: 0 0 10px; color: var(--muted); font-weight: 600;
                  text-transform: uppercase; letter-spacing: .5px;
@@ -97,6 +122,13 @@ h1 .sub { color: var(--muted); font-weight: 400; font-size: 13px; }
               border-radius: 6px; padding: 3px 9px; cursor: pointer; }
 .zoom-reset:hover { color: var(--text); border-color: var(--blue); }
 .chart-box { position: relative; height: 300px; }
+
+/* On the Recovery tab the HR chart pins to the top of the viewport so it stays in
+   view while you scroll the events table underneath and hover a row to spotlight
+   it. Slightly shorter when pinned so it doesn't swallow the screen. */
+.chart-wrap.sticky { position: sticky; top: 8px; z-index: 5;
+                     box-shadow: 0 10px 24px rgba(0,0,0,.45); }
+.chart-wrap.sticky .chart-box { height: 240px; }
 
 /* ---- activity timeline summary (walk/jog/run/sprint/still %) ---- */
 .act-summary { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
@@ -122,6 +154,8 @@ table.rec tbody tr:hover, table.rec tbody tr.hot { background: #1a2233; }
 table.rec tbody tr.hot td:first-child { box-shadow: inset 3px 0 0 #f0b429; }
 table.rec td b { font-weight: 700; }
 table.rec td .dim { color: var(--muted); }
+/* a "~time" projected from the τ rate (HR left the window before reaching baseline) */
+table.rec td .est { color: var(--amber); font-style: italic; }
 .rec-pill { display: inline-flex; align-items: center; justify-content: center;
             width: 20px; height: 20px; border-radius: 50%; background: #f85149;
             color: #0d1117; font-weight: 700; font-size: 11px; }

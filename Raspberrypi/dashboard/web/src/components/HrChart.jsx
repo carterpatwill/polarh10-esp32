@@ -4,7 +4,7 @@ import { mkChart, activityBand, recoveryOverlay } from "../lib/charts.js";
 // Heart-rate line with the activity band + recovery overlay plugins. Rebuilds when
 // the HR series changes; the activity/recovery overlays update the live chart in
 // place (so arriving async without a full redraw), matching the old behavior.
-export default function HrChart({ hr, activity, recovery, highlight = null }) {
+export default function HrChart({ hr, activity, recovery, highlight = null, sticky = false }) {
   const canvasRef = useRef(null);
   const chartRef = useRef(null);
 
@@ -43,7 +43,7 @@ export default function HrChart({ hr, activity, recovery, highlight = null }) {
   }, [highlight]);
 
   return (
-    <div className="chart-wrap">
+    <div className={"chart-wrap" + (sticky ? " sticky" : "")}>
       <h2>Heart rate (BPM) <span className="spacer" />
         <button className="zoom-reset" onClick={() => chartRef.current?.resetZoom()}>reset zoom</button></h2>
       <div className="chart-box"><canvas ref={canvasRef} /></div>

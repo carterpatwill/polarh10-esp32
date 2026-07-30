@@ -34,6 +34,28 @@ function recoveryInsight(d) {
 
 const cell = (v, suf = "") => (v == null ? <span className="dim">–</span> : <>{v}{suf}</>);
 
+// Time-to-baseline cell. If HR actually settled within the window, show the real
+// time. If it left the window early but we have a τ decay rate, PROJECT when it
+// would reach baseline (HR hits resting+10 at t = τ·ln((peak−resting)/10)) and mark
+// it "~". Only when there's no τ to extrapolate from do we fall back to ">length".
+function toBaseCell(e, resting) {
+  if (e.reached) return fmtElapsed(e.to_base);
+  if (e.tau && e.peak_bpm - resting > 10) {
+    const est = e.tau * Math.log((e.peak_bpm - resting) / 10);
+    return <span className="est">~{fmtElapsed(est)}</span>;
+  }
+  return <span className="dim">&gt;{fmtElapsed(e.dur)}</span>;
+}
+
+// Color τ on a green→yellow→red scale — smaller τ = faster recovery = greener.
+// At/below GOOD it's full green, at/above BAD full red, linearly through yellow.
+function tauColor(tau) {
+  if (tau == null) return undefined;
+  const GOOD = 50, BAD = 150;                                   // seconds
+  const f = Math.max(0, Math.min(1, (tau - GOOD) / (BAD - GOOD)));
+  return `hsl(${120 * (1 - f)}, 60%, 55%)`;                     // 120=green → 0=red
+}
+
 // Per-effort heart-rate recovery: headline cards, an insight line, and the table
 // scoring every effort. Renders nothing unless there are scored events.
 // `highlight` is the event number currently spotlighted on the HR chart, and
@@ -74,13 +96,13 @@ export default function RecoveryPanel({ rec, highlight = null, onHover }) {
           <tr>
             <th data-tip="Recovery event number, in order">#</th>
             <th data-tip="Highest heart rate at the start of this recovery (bpm).">peak</th>
-            <th data-tip="When this effort peaked — elapsed time into the session.">@time</th>
+            <th data-tip="How long this recovery lasted — from the peak until the next effort, the time cap, or the recording's end.">length of recovery</th>
             <th data-tip="Initial recovery rate — how fast HR fell over the first minute (bpm per minute). Bigger = faster recovery.">rate</th>
             <th data-tip="Heart rate difference after 60 seconds — how many bpm HR dropped in the first minute after the peak. The clinical fitness standard.">HRR60</th>
             <th data-tip="Heart rate difference after 120 seconds — bpm dropped in the first two minutes after the peak.">HRR120</th>
             <th data-tip="Tau (τ): the time constant of the exponential decay HR settles along. Smaller = faster recovery.">τ</th>
-            <th data-tip="Time until HR fell back within 10 bpm of your resting HR. A '>' means it never got there in the window.">to base</th>
-            <th data-tip="RMSSD ~60s after the peak — heart-rate variability (ms). Crushed by effort, it climbs back toward your resting ~59 ms as you recover.">RMSSD@60</th>
+            <th data-tip="Time until HR fell back within 10 bpm of your resting HR. A '~' is projected from the τ decay rate — how long it WOULD take at this recovery rate — when HR left the window before actually getting there. A '>' means it never got there and there was no τ to project from.">time till recovered</th>
+            <th data-tip="Post-effort heart-rate variability — RMSSD (ms) sampled ~60s after the peak, during cooldown. Crushed by effort, it climbs back toward your resting ~59 ms as you recover.">HRV</th>
           </tr>
         </thead>
         <tbody>
@@ -90,12 +112,12 @@ export default function RecoveryPanel({ rec, highlight = null, onHover }) {
                 onMouseEnter={() => onHover?.(e.n)}>
               <td><span className="rec-pill">{e.n}</span></td>
               <td><b>{e.peak_bpm}</b></td>
-              <td>{fmtElapsed(e.peak_t)}</td>
+              <td>{fmtElapsed(e.dur)}</td>
               <td><b style={{ color: "#39d0d8" }}>{cell(e.slope)}</b></td>
               <td>{cell(e.hrr60)}</td>
               <td>{cell(e.hrr120)}</td>
-              <td>{cell(e.tau, " s")}</td>
-              <td>{e.reached ? fmtElapsed(e.to_base) : <span className="dim">&gt;{fmtElapsed(e.dur)}</span>}</td>
+              <td style={{ color: tauColor(e.tau), fontWeight: e.tau != null ? 700 : undefined }}>{cell(e.tau, " s")}</td>
+              <td>{toBaseCell(e, rec.resting)}</td>
               <td>{cell(e.rmssd60, " ms")}</td>
             </tr>
           ))}

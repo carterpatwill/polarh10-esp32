@@ -65,6 +65,10 @@ export default function SessionDetail() {
   );
 
   const st = d.stats || {};
+  // Where the average sits along the min→max range, as a 0–100% offset for the dot.
+  const bpmPct = (st.min != null && st.max != null && st.max > st.min && st.avg != null)
+    ? Math.max(0, Math.min(100, ((st.avg - st.min) / (st.max - st.min)) * 100))
+    : 50;
   return (
     <section>
       <Link className="back" to="/">← All sessions</Link>
@@ -79,7 +83,7 @@ export default function SessionDetail() {
       {/* The HR chart stays put on top — tabs below only swap what's shown, so the
           curve is a stable backdrop the recovery hover can spotlight against. */}
       <HrChart hr={d.hr} activity={activity?.segments || null}
-               recovery={recovery} highlight={hotEvent} />
+               recovery={recovery} highlight={hotEvent} sticky={tab === "recovery"} />
 
       <div className="tabs">
         {TABS.map((t) => (
@@ -89,14 +93,32 @@ export default function SessionDetail() {
       </div>
 
       {tab === "hr" && (
-        <div className="cards">
-          <Card k="Duration">{fmtDur(d.duration_s)}</Card>
-          <Card k="Avg BPM">{st.avg ?? "–"}</Card>
-          <Card k="Min BPM">{st.min ?? "–"}</Card>
-          <Card k="Max BPM">{st.max ?? "–"}</Card>
-          <Card k="HR samples">{(d.hr_total ?? 0).toLocaleString()}</Card>
-          <Card k="Acc samples">{(d.acc_total ?? 0).toLocaleString()}</Card>
-        </div>
+        <>
+          {/* The three BPM numbers are the story — group them big. Duration + sample
+              counts are context, so they sit small and muted underneath. */}
+          <div className="bpm-panel">
+            <div className="cap">Beats per minute</div>
+            {/* min ── avg dot ── max, laid out like a range/gauge bar */}
+            <div className="bpm-range">
+              <div className="end"><div className="n">{st.min ?? "–"}</div><div className="l">min</div></div>
+              <div className="track">
+                <div className="bar" />
+                {st.avg != null && (
+                  <div className="marker" style={{ left: `${bpmPct}%` }}>
+                    <div className="avg">{st.avg} <span>avg</span></div>
+                    <div className="dot" />
+                  </div>
+                )}
+              </div>
+              <div className="end"><div className="n">{st.max ?? "–"}</div><div className="l">max</div></div>
+            </div>
+          </div>
+          <div className="hr-meta">
+            <b>{fmtDur(d.duration_s)}</b> duration
+            {"  ·  "}{(d.hr_total ?? 0).toLocaleString()} HR samples
+            {"  ·  "}{(d.acc_total ?? 0).toLocaleString()} accelerometer samples
+          </div>
+        </>
       )}
 
       {tab === "recovery" && (
