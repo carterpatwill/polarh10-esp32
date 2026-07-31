@@ -57,6 +57,15 @@ accelerometer
 <img src="docs/images/RasberryPi-1G.jpg" height="200" alt="Raspberry Pi 1GB"/>
 </p>
 
+### 3D-Printed Case
+
+Print-ready STL files for the on-body enclosure live in [`docs/stl/`](docs/stl/):
+
+| File | Part |
+|---|---|
+| [`esptop_panther.stl`](docs/stl/esptop_panther.stl) | Top cover |
+| [`ESP32S3_Bottom.stl`](docs/stl/ESP32S3_Bottom.stl) | Bottom shell (holds the XIAO ESP32-S3) |
+
 ---
 
 ## Project Structure
