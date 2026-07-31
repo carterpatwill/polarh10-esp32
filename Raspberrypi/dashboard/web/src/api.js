@@ -21,6 +21,9 @@ export const getSession = (id) => getJSON(`/api/session/${id}`);
 export const getTimeline = (id) => getJSON(`/api/session/${id}/timeline`);
 export const getRecovery = (id) => getJSON(`/api/session/${id}/recovery`);
 
+// ---- morning HRV readiness ----
+export const getMorning = () => getJSON("/api/morning");
+
 export async function renameSession(id, name) {
   const { ok, data } = await postJSON(`/api/session/${id}/name`, { name });
   if (!ok) throw new Error(data.error || "save failed");

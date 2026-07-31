@@ -6,7 +6,7 @@ web/, built to static/dist/ and served from here. In dev you instead run Vite
 """
 from flask import Flask, jsonify, send_from_directory
 
-from . import analysis, labeling, sessions
+from . import analysis, labeling, morning, sessions
 from .config import DIST_DIR
 
 
@@ -18,6 +18,7 @@ def create_app():
     app.register_blueprint(sessions.bp)
     app.register_blueprint(analysis.bp)
     app.register_blueprint(labeling.bp)
+    app.register_blueprint(morning.bp)
 
     @app.route("/")
     def index():

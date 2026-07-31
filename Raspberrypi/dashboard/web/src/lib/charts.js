@@ -164,3 +164,8 @@ export function mkChart(canvas, datasets, yTitle, opts = {}) {
   canvas.ondblclick = () => chart.resetZoom();
   return chart;
 }
+
+// Re-exported so other chart components (e.g. the morning-HRV trend, which uses a
+// category x-axis rather than the elapsed-seconds one mkChart hard-codes) get the
+// same already-registered Chart without registering the plugins a second time.
+export { Chart };

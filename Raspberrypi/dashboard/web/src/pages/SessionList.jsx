@@ -73,7 +73,8 @@ export default function SessionList() {
   return (
     <section>
       <h1>Sessions <span className="sub">— Polar H10 on the Pi</span>
-        <Link to="/label" style={{ float: "right", fontSize: 13, fontWeight: 600 }}>🏷 Label &amp; Train →</Link></h1>
+        <Link to="/label" style={{ float: "right", fontSize: 13, fontWeight: 600 }}>🏷 Label &amp; Train →</Link>
+        <Link to="/morning" style={{ float: "right", fontSize: 13, fontWeight: 600, marginRight: 16 }}>🌅 Morning HRV →</Link></h1>
 
       <div className="tabs">
         <Link to="/" className={"tab" + (tab === "workouts" ? " active" : "")}>

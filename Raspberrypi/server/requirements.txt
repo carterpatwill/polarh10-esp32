@@ -1,1 +1,4 @@
 paho-mqtt>=2.0
+# morning_hrv.py — BLE capture straight from the Pi + RR/RMSSD/respiration math
+bleak>=0.22
+numpy>=1.24

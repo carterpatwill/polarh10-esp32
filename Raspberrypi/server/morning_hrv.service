@@ -1,0 +1,16 @@
+[Unit]
+Description=Morning HRV baseline capture (Polar H10 → BLE → SQLite) for the Pi
+After=network.target bluetooth.target
+Wants=bluetooth.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__DIR__
+Environment=PYTHONUNBUFFERED=1
+ExecStart=__DIR__/.venv/bin/python3 __DIR__/morning_hrv.py watch
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target
