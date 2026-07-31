@@ -96,7 +96,14 @@ def session_detail(sid):
     bpms = [r["bpm"] for r in hr]
     stats = {}
     if bpms:
-        stats = {"min": min(bpms), "max": max(bpms), "avg": round(sum(bpms) / len(bpms))}
+        # A bpm of 0 is a dropout/invalid reading, not a real low — exclude it
+        # from min so the minimum is the next valid (non-zero) heart rate.
+        nonzero = [b for b in bpms if b > 0]
+        stats = {
+            "min": min(nonzero) if nonzero else min(bpms),
+            "max": max(bpms),
+            "avg": round(sum(bpms) / len(bpms)),
+        }
 
     dur = dur_seconds(meta["started"], meta["ended"])
     if dur is None and (hr or acc):
