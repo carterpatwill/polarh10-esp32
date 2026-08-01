@@ -8,12 +8,13 @@
 //     it connects a session begins: HR + ACC (25 Hz) are written to onboard
 //     flash (LittleFS) as CSV. A brief strap dropout resumes the same session;
 //     a long gap finalizes it and the next connect starts a new one.
-//       LED: solid = recording, slow blink = scanning, triple-blink = flash full.
+//       BLE light (GPIO1): blink = scanning, solid ~2 s on connect then off.
+//       User light (GPIO21): off on battery (fast blink = flash full).
 //
 //   SYNC (when plugged into USB)
 //     Recording pauses, WiFi comes up, and the stored session files are pushed to
 //     the Pi over MQTT (TLS to HiveMQ), then deleted on success.
-//       LED: fast blink.
+//       User light (GPIO21): solid on while plugged in; BLE light off.
 //
 // This file is only the orchestrator — all logic lives in the modules below:
 //   ble/       scan, secure connect, HR + ACC decode

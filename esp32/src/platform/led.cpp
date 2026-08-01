@@ -8,107 +8,103 @@
 
 namespace platform::led {
 
-// GPIO21, active-low (LOW = lit). See config.h for the state legend, and
-// docs/led-blink-patterns.md for the full pattern reference ('.' = on, '_' = off).
-static constexpr int PIN_BL = PIN_STATUS_LED;
+// Two LEDs (see docs/led-blink-patterns.md, '.' = on / '_' = off):
+//   user light — GPIO21, active-low  → WiFi/sync indicator
+//   BLE  light — GPIO1,  active-high → Polar-strap connection indicator
+static constexpr int PIN_USER = PIN_STATUS_LED;
+static constexpr int PIN_BLE  = PIN_BLE_LED;
 
 void begin() {
     if (PIN_POWER_ON >= 0) {           // peripheral power-enable (unused on XIAO)
         pinMode(PIN_POWER_ON, OUTPUT);
         digitalWrite(PIN_POWER_ON, HIGH);
     }
-    pinMode(PIN_BL, OUTPUT);
-    digitalWrite(PIN_BL, HIGH);         // off
+    pinMode(PIN_USER, OUTPUT);
+    digitalWrite(PIN_USER, STATUS_LED_OFF);
+    pinMode(PIN_BLE, OUTPUT);
+    digitalWrite(PIN_BLE, BLE_LED_OFF);
 }
 
+// Raw drive of the user light (GPIO21). Used while blocking on a WiFi join.
 void set(bool on) {
-    digitalWrite(PIN_BL, on ? LOW : HIGH);
+    digitalWrite(PIN_USER, on ? STATUS_LED_ON : STATUS_LED_OFF);
+}
+
+// Raw drive of the BLE light (GPIO1). Used to force it off when entering sync.
+void bleSet(bool on) {
+    digitalWrite(PIN_BLE, on ? BLE_LED_ON : BLE_LED_OFF);
 }
 
 namespace {
 
-// Repeating patterns are boolean frames played one slot at a time (true = lit).
-constexpr uint32_t SLOT_MS = 130;
+void setBle(bool on) { bleSet(on); }
 
-// Looking for Polar: three blinks then a pause  →  ...___
-const bool SCAN_POLAR[] = {1, 0, 1, 0, 1, 0, 0, 0, 0, 0};
-// Looking for WiFi (USB plugged in): one blink then a long gap  →  .____
-const bool SCAN_WIFI[]  = {1, 0, 0, 0, 0, 0, 0, 0};
-
-// Play a repeating frame pattern at SLOT_MS per frame. Switching to a different
-// pattern restarts it cleanly from frame 0.
-void playLoop(const bool* frames, size_t n) {
-    static const bool* cur      = nullptr;
-    static uint32_t    lastTick = 0;
-    static size_t      idx      = 0;
+// Even 50/50 blink of the BLE LED while scanning for the strap.
+void bleBlink() {
+    static uint32_t tick = 0;
+    static bool     on   = false;
     uint32_t now = millis();
-
-    if (frames != cur) {                 // pattern changed → restart
-        cur = frames; idx = 0; lastTick = now; set(frames[0]);
-        return;
-    }
-    if (now - lastTick >= SLOT_MS) {
-        lastTick = now;
-        idx = (idx + 1) % n;
-        set(frames[idx]);
-    }
+    if (now - tick >= 250) { tick = now; on = !on; setBle(on); }
 }
 
 }  // namespace
 
-// Drive the LED to reflect the current state. Non-blocking; called every loop.
-//   Record mode, no strap   → ...___ scan blink (looking for Polar)
-//   Record mode, strap found → 8 fast blinks once, then LED off while recording
-//   Record mode, flash full  → continuous fast blink (distinct from the scan)
-//   Sync mode, no WiFi yet   → .____ blink (looking for WiFi)
-//   Sync mode, WiFi joined   → solid on
+// Drive both LEDs to reflect the current state. Non-blocking; called every loop.
+//   User light (WiFi):
+//     Sync mode (USB plugged in) → solid on the whole time, until unplugged.
+//     Record mode (on battery)   → off (or fast blink if the flash is full).
+//   BLE light (Polar strap):
+//     Scanning                   → blink.
+//     Just connected             → solid for BLE_CONNECT_HOLD_MS, then off.
+//     Recording / not scanning   → off.
 void update() {
     uint32_t now = millis();
     Mode mode = syncmode::current();
 
-    // --- Sync mode (USB plugged in) ---
+    // ── Sync mode (USB plugged in) ────────────────────────────────────────────
     if (mode == Mode::Sync) {
-        if (WiFi.status() == WL_CONNECTED) { set(true); return; }   // WiFi found → solid
-        playLoop(SCAN_WIFI, sizeof(SCAN_WIFI));                      // searching → .____
+        setBle(false);                              // BLE LED off while syncing
+        if (WiFi.status() == WL_CONNECTED) {
+            set(true);                              // WiFi found → user light solid
+        } else {
+            static uint32_t wTick = 0;
+            static bool     wOn   = false;
+            if (now - wTick >= 250) { wTick = now; wOn = !wOn; set(wOn); }  // searching → flash
+        }
         return;
     }
 
-    // --- Record mode ---
-    // Flash full takes precedence: continuous fast blink so it can't be
-    // mistaken for the "looking for Polar" scan pattern.
+    // ── Record mode (on battery) ──────────────────────────────────────────────
+    // User light is the WiFi indicator only, so it stays dark on battery —
+    // except a full flash, which borrows it as a continuous fast-blink alarm.
     if (record::isFlashFull()) {
         static uint32_t ffTick = 0;
         static bool     ffOn   = false;
         if (now - ffTick >= 100) { ffTick = now; ffOn = !ffOn; set(ffOn); }
+        setBle(false);
         return;
     }
+    set(false);
 
+    // BLE light: blink while scanning; on connect hold solid for a moment, then
+    // go dark for the rest of the recording.
     static bool     wasConnected = false;
-    static bool     bursting     = false;
-    static uint32_t burstTick    = 0;
-    static uint8_t  burstStep    = 0;
+    static bool     holding      = false;
+    static uint32_t holdUntil    = 0;
 
     bool connected = ble::isConnected();
-
-    // Rising edge: the strap just connected → play the 8-blink "found it" burst.
-    if (connected && !wasConnected) {
-        bursting = true; burstStep = 0; burstTick = now; set(true);
-    }
+    if (connected && !wasConnected) { holding = true; holdUntil = now + BLE_CONNECT_HOLD_MS; }
+    if (!connected)                 { holding = false; }
     wasConnected = connected;
 
-    if (!connected) { playLoop(SCAN_POLAR, sizeof(SCAN_POLAR)); return; }
-
-    // Connected. 8 fast blinks (16 half-steps @ 80 ms), then the LED goes dark
-    // and stays off while recording quietly.
-    if (bursting) {
-        if (now - burstTick >= 80) {
-            burstTick = now;
-            if (++burstStep >= 16) { bursting = false; set(false); return; }
-            set(burstStep % 2 == 0);
-        }
-        return;
+    if (!connected) {
+        bleBlink();
+    } else if (holding && (int32_t)(holdUntil - now) > 0) {
+        setBle(true);                 // just connected → solid confirmation
+    } else {
+        holding = false;
+        setBle(false);                // connected & confirmed → off while recording
     }
-    set(false);   // recording quietly → LED off
 }
 
 }  // namespace platform::led

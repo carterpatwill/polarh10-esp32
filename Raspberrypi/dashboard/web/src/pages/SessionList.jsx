@@ -65,19 +65,25 @@ export default function SessionList() {
 
   useEffect(() => { load(); }, [load]);
 
-  // Training data (kind='train') has its own tab; everything else is a workout.
+  // Training data (kind='train') has its own tab; morning HRV captures live on the
+  // /morning page (their raw trace is stored as a 'morning hrv'-labelled session, so
+  // filter it out here); everything else is a workout.
   const actions = useSessionActions({ onRenamed: load, onDeleted: load });
+  const isMorning = (s) => (s.label || "").toLowerCase() === "morning hrv";
   const training = (sessions || []).filter((s) => s.kind === "train");
-  const workouts = (sessions || []).filter((s) => s.kind !== "train");
+  const workouts = (sessions || []).filter((s) => s.kind !== "train" && !isMorning(s));
 
   return (
     <section>
       <h1>Sessions <span className="sub">— Polar H10 on the Pi</span>
-        <Link to="/label" style={{ float: "right", fontSize: 13, fontWeight: 600 }}>🏷 Label &amp; Train →</Link>
-        <Link to="/morning" style={{ float: "right", fontSize: 13, fontWeight: 600, marginRight: 16 }}>🌅 Morning HRV →</Link></h1>
+        <span className="home-nav">
+          <Link to="/">← Today</Link>
+          <Link to="/morning">🌅 Morning HRV</Link>
+          <Link to="/label">🏷 Label &amp; Train</Link>
+        </span></h1>
 
       <div className="tabs">
-        <Link to="/" className={"tab" + (tab === "workouts" ? " active" : "")}>
+        <Link to="/sessions" className={"tab" + (tab === "workouts" ? " active" : "")}>
           Workouts <span className="count">{workouts.length || ""}</span></Link>
         <Link to="/training" className={"tab" + (tab === "training" ? " active" : "")}>
           🏋 Training data <span className="count">{training.length || ""}</span></Link>

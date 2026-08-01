@@ -23,6 +23,7 @@ void enter() {
     // Stop recording: close any open session and drop the strap so BLE is idle.
     record::close();
     ble::stopAndDisconnect();
+    platform::led::bleSet(false);   // BLE LED off for the whole sync session
 
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);
