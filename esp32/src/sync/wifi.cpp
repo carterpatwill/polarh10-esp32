@@ -57,6 +57,7 @@ bool joinAny() {
     // Keep cycling through the networks until one associates or USB is unplugged.
     // Each network gets a longer window before we move on to the next.
     while (platform::usb::hostPresent()) {
+        if (joinWpa2(SYNC_SSID0, SYNC_PASS0, 30000))  return true;   // AFCWEST (tried first)
         if (joinEnterprise(30000))                    return true;   // eduroam
         if (joinWpa2(SYNC_SSID, SYNC_PASS, 30000))    return true;   // Cambridge bar and grill
         Serial.println("\n[SYNC] No WiFi yet — cycling again");

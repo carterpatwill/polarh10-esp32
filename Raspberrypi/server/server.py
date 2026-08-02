@@ -32,16 +32,24 @@ MQTT_TOPIC_ACC = os.environ.get("MQTT_TOPIC_ACC", "polar/acc")
 MQTT_TOPIC_PI      = os.environ.get("MQTT_TOPIC_PI",      "pi/status")     # heartbeat we publish
 MQTT_TOPIC_SESSION = os.environ.get("MQTT_TOPIC_SESSION", "polar/session") # start/stop we receive (from ESP, carries label)
 MQTT_TOPIC_CMD     = os.environ.get("MQTT_TOPIC_CMD",     "polar/session_cmd") # control page → ESP; we also read it for `kind`
+MQTT_TOPIC_ACK     = os.environ.get("MQTT_TOPIC_ACK",     "polar/ack")         # we publish per-session delete confirmations here
 
 HEARTBEAT_S = 5   # publish pi/status this often
 
 DB_PATH = Path(__file__).parent / "hr_data.db"
 
 # Live state shared with the heartbeat thread.
-current_session_id = None            # id of the open session, or None when idle
+current_session_id = None            # id of the session we're actively ingesting (heartbeat/legacy)
 last_write_iso     = None            # ISO time of the most recent DB insert
 pending_kind       = "metric"        # kind ('train'/'metric') for the next session to open;
                                      # set from the control page's session_cmd (path A, no ESP reflash)
+
+# Per-recording upload state, keyed by the ESP32's stable upload id (uid).
+#   uid -> {"sid": <sessions.id>, "complete": <bool, session finalized+stored>}
+# Data messages self-identify with their uid, so nothing depends on message order:
+# a lost/late "start" is recovered by lazily creating the row, and a re-upload of a
+# completed recording is recognised and ignored (then re-acked) instead of duplicated.
+uploads = {}
 
 
 def init_db(conn):
@@ -81,8 +89,11 @@ def init_db(conn):
         except sqlite3.OperationalError:
             pass
     # Backfill columns on DBs created before they existed (each a no-op if present).
+    # upload_uid is the ESP32's stable per-recording id; it lets a re-uploaded file
+    # map back to its existing session row instead of spawning a duplicate.
     for ddl in ("ALTER TABLE sessions ADD COLUMN label TEXT",
-                "ALTER TABLE sessions ADD COLUMN kind TEXT DEFAULT 'metric'"):
+                "ALTER TABLE sessions ADD COLUMN kind TEXT DEFAULT 'metric'",
+                "ALTER TABLE sessions ADD COLUMN upload_uid INTEGER"):
         try:
             conn.execute(ddl)
         except sqlite3.OperationalError:
@@ -112,53 +123,155 @@ def handle_cmd(data):
         pending_kind = kind if kind in ("train", "metric") else "metric"
 
 
-def handle_session(data, received):
-    """Open/close a session row and set the id we tag incoming data with."""
+def _epoch_to_started(epoch, received):
+    """Render the ESP32's reconstructed Unix start time in local time to match
+    `received`. Absent/bogus epoch → fall back to sync-receipt time."""
+    try:
+        return datetime.fromtimestamp(epoch).isoformat(timespec="seconds") if epoch else received
+    except (TypeError, ValueError, OSError, OverflowError):
+        return received
+
+
+def _get_session_by_uid(conn, uid):
+    """Return (sid, complete) for an existing session with this uid, or None."""
+    row = conn.execute("SELECT id, ended FROM sessions WHERE upload_uid=?", (uid,)).fetchone()
+    return (row[0], row[1] is not None) if row else None
+
+
+def _sid_for_data(conn, uid, received):
+    """Session id to tag an incoming HR/ACC batch with, or None to skip storing.
+
+    uid is None (legacy firmware) → fall back to the global open session.
+    uid is known-complete         → None, so a re-sent finished recording is ignored.
+    uid unseen (start lost/late)  → lazily create the session so nothing orphans.
+    """
+    if uid is None:
+        return current_session_id
+    u = uploads.get(uid)
+    if u is None:
+        existing = _get_session_by_uid(conn, uid)
+        if existing:
+            sid, complete = existing
+        else:
+            cur = conn.execute(
+                "INSERT INTO sessions (started, kind, upload_uid) VALUES (?, ?, ?)",
+                (received, pending_kind, uid))
+            sid, complete = cur.lastrowid, False
+            conn.commit()
+        u = uploads[uid] = {"sid": sid, "complete": complete}
+    return None if u["complete"] else u["sid"]
+
+
+def _publish_ack(client, uid, hr, acc):
+    """Tell the ESP32 how many rows we have stored for this recording. It deletes
+    the file only once this covers what it sent."""
+    client.publish(MQTT_TOPIC_ACK, json.dumps({"uid": uid, "hr": hr, "acc": acc}))
+
+
+def handle_session(client, data, received):
+    """Open/close a session by its uid and, on stop, ack what we stored so the
+    ESP32 can safely delete the file."""
     global current_session_id
     action = data.get("action")
+    uid    = data.get("uid")
+
+    # Legacy firmware (no uid): keep the old single-global-session behaviour.
+    if uid is None:
+        return _handle_session_legacy(data, received, action)
+
     with sqlite3.connect(DB_PATH) as conn:
         if action == "start":
             label = (data.get("label") or "").strip() or None
-            # The ESP (BLE-only sync) sends the reconstructed real start time as a Unix
-            # epoch; render it in local time to match `received`. Absent/bogus → sync time.
-            epoch = data.get("started_epoch")
-            try:
-                started = datetime.fromtimestamp(epoch).isoformat(timespec="seconds") if epoch else received
-            except (TypeError, ValueError, OSError, OverflowError):
-                started = received
+            started = _epoch_to_started(data.get("started_epoch"), received)
+            existing = _get_session_by_uid(conn, uid)
+            if existing and existing[1]:
+                # Already stored and finalized before — a retry whose ack was lost.
+                # Don't touch the data; the stop will just re-ack it.
+                sid = existing[0]
+                uploads[uid] = {"sid": sid, "complete": True}
+                print(f"[session] START uid={uid} → already complete id={sid}, will re-ack")
+            else:
+                if existing:                       # resume of a partial upload: start fresh
+                    sid = existing[0]
+                    conn.execute("DELETE FROM hr  WHERE session=?", (sid,))
+                    conn.execute("DELETE FROM acc WHERE session=?", (sid,))
+                    conn.execute("UPDATE sessions SET started=?, label=?, kind=?, ended=NULL WHERE id=?",
+                                 (started, label, pending_kind, sid))
+                else:
+                    cur = conn.execute(
+                        "INSERT INTO sessions (started, label, kind, upload_uid) VALUES (?, ?, ?, ?)",
+                        (started, label, pending_kind, uid))
+                    sid = cur.lastrowid
+                conn.commit()
+                uploads[uid] = {"sid": sid, "complete": False}
+                current_session_id = sid
+                print(f"[session] START uid={uid} → id={sid} at {started}"
+                      + f"  kind={pending_kind}" + (f"  label={label!r}" if label else ""))
+
+        elif action == "stop":
+            u = uploads.get(uid)
+            if u is None:                          # data seen but start+stop only now
+                existing = _get_session_by_uid(conn, uid)
+                if existing:
+                    u = {"sid": existing[0], "complete": existing[1]}
+            if not u:
+                # Never saw start or any data for this uid — ack zero so the ESP32
+                # keeps the file and retries (rather than deleting unstored data).
+                _publish_ack(client, uid, 0, 0)
+                print(f"[session] STOP uid={uid} → unknown, ack 0/0")
+                return
+            sid = u["sid"]
+            if not u["complete"]:
+                conn.execute("UPDATE sessions SET ended=? WHERE id=?", (received, sid))
+                conn.commit()
+                u["complete"] = True
+                uploads[uid] = u
+            hr  = conn.execute("SELECT COUNT(*) FROM hr  WHERE session=?", (sid,)).fetchone()[0]
+            acc = conn.execute("SELECT COUNT(*) FROM acc WHERE session=?", (sid,)).fetchone()[0]
+            _publish_ack(client, uid, hr, acc)
+            current_session_id = None
+            print(f"[session] STOP uid={uid} id={sid} → ack hr={hr} acc={acc}")
+
+
+def _handle_session_legacy(data, received, action):
+    """Pre-uid firmware path: one global open session, no ack."""
+    global current_session_id
+    with sqlite3.connect(DB_PATH) as conn:
+        if action == "start":
+            label = (data.get("label") or "").strip() or None
+            started = _epoch_to_started(data.get("started_epoch"), received)
             cur = conn.execute("INSERT INTO sessions (started, label, kind) VALUES (?, ?, ?)",
                                (started, label, pending_kind))
             conn.commit()
             current_session_id = cur.lastrowid
-            print(f"[session] START → id={current_session_id} at {started}"
-                  + f"  kind={pending_kind}"
-                  + (f"  label={label!r}" if label else ""))
+            print(f"[session] START (legacy) → id={current_session_id} at {started}")
         elif action == "stop":
             if current_session_id is not None:
                 conn.execute("UPDATE sessions SET ended=? WHERE id=?",
                              (received, current_session_id))
                 conn.commit()
-                print(f"[session] STOP  → id={current_session_id} at {received}")
+                print(f"[session] STOP (legacy) → id={current_session_id}")
             current_session_id = None
 
 
 def handle_hr(data, received, ts):
     global last_write_iso
     readings = data.get("readings", [])   # "readings" here is the MQTT payload key, not the table
-    print(f"[{ts}] HR batch — {len(readings)} reading(s):")
+    uid      = data.get("uid")
     with sqlite3.connect(DB_PATH) as conn:
+        sid = _sid_for_data(conn, uid, received)
+        if sid is None and uid is not None:
+            print(f"[{ts}] HR batch uid={uid} — session already complete, ignoring {len(readings)}")
+            return
+        print(f"[{ts}] HR batch — {len(readings)} reading(s) → session {sid}:")
         for r in readings:
             bpm    = r["bpm"]
             t_ms   = r.get("t_ms", 0)
             rr     = r.get("rr_ms", [])
             rr_str = json.dumps([round(x) for x in rr]) if rr else None
-
-            t_sec  = t_ms / 1000.0
-            print(f"  t={t_sec:.1f}s  {bpm} BPM" + (f"  RR: {rr_str} ms" if rr_str else ""))
-
             conn.execute(
                 "INSERT INTO hr (received, t_ms, bpm, rr_ms, session) VALUES (?, ?, ?, ?, ?)",
-                (received, t_ms, bpm, rr_str, current_session_id),
+                (received, t_ms, bpm, rr_str, sid),
             )
         conn.commit()
         total = conn.execute("SELECT COUNT(*) FROM hr").fetchone()[0]
@@ -171,11 +284,16 @@ def handle_acc(data, received, ts):
     # Samples are compact arrays: [t_ms, x, y, z]
     samples = data.get("samples", [])
     rate    = data.get("sample_rate_hz", "?")
-    print(f"[{ts}] ACC batch — {len(samples)} sample(s) @ {rate} Hz")
+    uid     = data.get("uid")
     with sqlite3.connect(DB_PATH) as conn:
+        sid = _sid_for_data(conn, uid, received)
+        if sid is None and uid is not None:
+            print(f"[{ts}] ACC batch uid={uid} — session already complete, ignoring {len(samples)}")
+            return
+        print(f"[{ts}] ACC batch — {len(samples)} sample(s) @ {rate} Hz → session {sid}")
         conn.executemany(
             "INSERT INTO acc (received, t_ms, x, y, z, session) VALUES (?, ?, ?, ?, ?, ?)",
-            [(received, s[0], s[1], s[2], s[3], current_session_id) for s in samples if len(s) == 4],
+            [(received, s[0], s[1], s[2], s[3], sid) for s in samples if len(s) == 4],
         )
         conn.commit()
         total = conn.execute("SELECT COUNT(*) FROM acc").fetchone()[0]
@@ -198,7 +316,7 @@ def on_message(client, userdata, msg):
     if msg.topic == MQTT_TOPIC_CMD:
         handle_cmd(data)
     elif msg.topic == MQTT_TOPIC_SESSION:
-        handle_session(data, received)
+        handle_session(client, data, received)
     elif msg.topic == MQTT_TOPIC_ACC:
         handle_acc(data, received, ts)
     else:
