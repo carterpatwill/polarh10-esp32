@@ -66,8 +66,9 @@ RESP_FS_HZ   = 4.0     # resample the RR tachogram to this even rate before the 
 RESP_LO_HZ   = 0.15    # 0.15–0.40 Hz  ==  9–24 breaths/min, the plausible resting band
 RESP_HI_HZ   = 0.40
 
-# The receiver's DB sits next to this file; HR_DB overrides (matches the dashboard).
-DB_PATH = Path(os.environ.get("HR_DB", Path(__file__).parent / "hr_data.db"))
+# The receiver's DB sits in the server/ parent (shared with workout-daq + the
+# dashboard); this file now sits in server/morning-hrv/. HR_DB overrides.
+DB_PATH = Path(os.environ.get("HR_DB", Path(__file__).parent.parent / "hr_data.db"))
 LABEL   = "morning hrv"          # session label so the raw trace is recognisable in the UI
 
 
@@ -488,6 +489,48 @@ def cmd_baseline(conn, _args):
         print(f"  today ({b['today_date']}): ln {b['today']}  →  {b['status'].upper()}")
 
 
+def cmd_status(conn, _args):
+    """Snapshot of where the morning capture stands — no BLE, safe to run any time.
+
+    The systemd unit runs `watch` 24/7, so `systemctl is-active` is always 'active'
+    and tells you nothing about the morning. This answers the real questions: is the
+    window open right now, did we already capture today, and how does today sit vs.
+    the rolling baseline."""
+    now = datetime.now()
+    today = now.date().isoformat()
+    in_window = WINDOW_START_HOUR <= now.hour < WINDOW_END_HOUR
+
+    ensure_table(conn)
+    row = conn.execute(
+        "SELECT captured_at, rmssd, ln_rmssd, hr_rest, beats, quality "
+        "FROM morning_hrv WHERE date=?", (today,)).fetchone()
+
+    print(f"time    {now.strftime('%Y-%m-%d %H:%M')}  (Pi local)")
+    print(f"window  {WINDOW_START_HOUR:02d}:00–{WINDOW_END_HOUR:02d}:00  →  "
+          f"{'OPEN' if in_window else 'closed'}")
+
+    if row:
+        cap, rmssd, ln, hr, beats, quality = row
+        t = cap[11:16] if cap and len(cap) >= 16 else cap
+        print(f"today   ✓ captured {t} — RMSSD {rmssd} ms (ln {ln}), "
+              f"rest HR {hr}, {beats} beats [{quality}]")
+    elif in_window:
+        print("today   … no reading yet — window OPEN, armed & scanning for the strap")
+    else:
+        when = "later this morning" if now.hour < WINDOW_START_HOUR else "tomorrow"
+        print(f"today   ✗ no reading — window closed, idle until "
+              f"{WINDOW_START_HOUR:02d}:00 {when}")
+
+    b = compute_baseline(_fetch_rows(conn))
+    if b["n"] == 0:
+        print("base    no readings yet")
+    elif "mean" in b:
+        state = "meaningful" if b["ready"] else f"building {b['n']}/{b['need']}"
+        print(f"base    normal ln {b['lo']}…{b['hi']}  ({state})")
+        if b["today_date"] == today:
+            print(f"        today ln {b['today']} → {b['status'].upper()}")
+
+
 def main():
     p = argparse.ArgumentParser(description="Morning HRV baseline from the Polar H10 over BLE.")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -504,6 +547,7 @@ def main():
 
     sub.add_parser("list", help="print stored morning readings")
     sub.add_parser("baseline", help="print the rolling baseline + today's status")
+    sub.add_parser("status", help="window state + today's reading (no BLE, any time)")
 
     args = p.parse_args()
     conn = sqlite3.connect(DB_PATH)
@@ -518,6 +562,8 @@ def main():
             cmd_list(conn, args)
         elif args.cmd == "baseline":
             cmd_baseline(conn, args)
+        elif args.cmd == "status":
+            cmd_status(conn, args)
     finally:
         conn.close()
 

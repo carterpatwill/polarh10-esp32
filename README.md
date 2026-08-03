@@ -76,13 +76,18 @@ esp32/                      — PlatformIO project (flashed to the ESP32)
     main.cpp
     config.h                — WiFi + HiveMQ credentials (gitignored, edit this)
 Raspberrypi/
-  server/              — Python MQTT subscriber that runs on the Pi
-    server.py
-    install.sh              — one-time setup script
-    requirements.txt        — paho-mqtt
-    server.service     — systemd unit (auto-start on boot)
-    mqtt.env.example        — template for the Pi's credentials (copy to mqtt.env)
-  dashboard/                — Flask web dashboard the Pi hosts (reads hr_data.db)
+  server/              — shared root on the Pi: one .venv + one hr_data.db, two apps
+    install.sh              — one-time setup (venv + deps + both systemd units)
+    requirements.txt        — paho-mqtt + bleak + numpy (shared)
+    hr_data.db              — SQLite DB both apps write + the dashboard reads
+    workout-daq/            — ESP32 → MQTT → SQLite ingest
+      server.py
+      server.service        — systemd unit (auto-start on boot)
+      mqtt.env.example      — template for the Pi's credentials (copy to mqtt.env)
+    morning-hrv/            — Polar H10 → BLE → SQLite morning HRV baseline capture
+      morning_hrv.py
+      morning_hrv.service   — systemd unit → morning-hrv.service (runs `watch`)
+  dashboard/                — Flask web dashboard the Pi hosts (reads ../server/hr_data.db)
     app.py                  — server + JSON API
     templates/index.html    — live dashboard page (charts, LIVE/OFFLINE status)
     install.sh              — one-time setup (venv + Flask + systemd)
@@ -94,8 +99,12 @@ data/
   hr_data.db                — SQLite database (copied from Pi)
   analyze.py                — analysis script
 deploy-pi.sh                — push receiver code changes from Mac + restart (same network)
+migrate-pi.sh               — one-time: reshape the Pi's flat server/ into the split layout
 deploy-dashboard.sh         — push dashboard code changes from Mac + restart (same network)
-pi-server.sh                — start/stop/status the Pi services from Mac (same network)
+pi-server.sh                — start/stop/status any Pi service from Mac (server|dashboard)
+daq.sh                      — start/stop/status/logs the workout-DAQ receiver (server.service)
+morning.sh                  — start/stop/status/logs the morning-HRV capture; status shows the
+                              07:00–11:00 window state + today's reading, not just systemd
 ```
 
 ---
@@ -147,8 +156,8 @@ Then SSH in and run the one-time installer:
 ```bash
 ssh carter@pi4server.local
 cd ~/projects/python/esp-polar/server
-./install.sh          # creates the venv, installs paho-mqtt, sets up mqtt.env + systemd service
-nano mqtt.env         # fill in the SAME 4 HiveMQ values as config.h, then save
+./install.sh          # creates the shared venv, installs deps, sets up both systemd units
+nano workout-daq/mqtt.env   # fill in the SAME 4 HiveMQ values as config.h, then save
 sudo systemctl restart server
 ```
 
@@ -158,9 +167,37 @@ sudo systemctl restart server
 
 ## Running & Controlling the Pi Service
 
-The receiver runs as a systemd service (`server`) and auto-starts on boot. Three ways to control it depending on where you are:
+The Pi runs two independent services, each auto-starting on boot:
 
-### On your Mac, same network — `pi-server.sh`
+- **`server`** (workout DAQ) — ingests ESP32 → MQTT → SQLite.
+- **`morning-hrv`** — a 24/7 `watch` daemon that only captures inside the 07:00–11:00 window.
+
+### Per-service, from your Mac — `daq.sh` / `morning.sh`
+
+```bash
+./daq.sh     start|stop|restart|status|logs     # the workout-DAQ receiver
+./morning.sh start|stop|restart|status|logs     # the morning-HRV capture
+```
+
+`status` shows whether the unit is active and enabled-on-boot. For **morning-hrv**, systemd is
+*always* "active" (the watcher runs all day), so `./morning.sh status` also reports what actually
+matters — is the window open right now, did it already capture today, and how today sits vs. the
+rolling baseline:
+
+```
+daemon:  active   (enabled on boot: enabled)
+──
+time    2026-08-03 08:42  (Pi local)
+window  07:00–11:00  →  OPEN
+today   … no reading yet — window OPEN, armed & scanning for the strap
+base    normal ln 4.02…4.19  (building 5/7)
+```
+
+Both print a clear "can't reach the Pi — you must be on the same WiFi" message when you're off-network.
+
+### Any service, same network — `pi-server.sh`
+
+`pi-server.sh` is the generic version — it controls `server` (default) or `dashboard` via a second arg:
 
 ```bash
 ./pi-server.sh start      # start the receiver
@@ -204,7 +241,7 @@ After editing anything in `Raspberrypi/server/`, push it from your Mac (same net
 ./deploy-pi.sh
 ```
 
-This rsyncs the folder to `/home/carter/projects/python/esp-polar/server`, reinstalls Python deps, and restarts the service. It **never** overwrites the Pi's `.venv`, `hr_data.db`, or `mqtt.env`.
+This rsyncs the folder (including the `workout-daq/` and `morning-hrv/` subfolders) to `/home/carter/projects/python/esp-polar/server`, reinstalls Python deps, and restarts whichever of `server` / `morning-hrv` are installed. It **never** overwrites the Pi's `.venv`, `hr_data.db`, or `mqtt.env`.
 
 > If you edit `server.service` itself, re-register the systemd unit once on the Pi (re-run `./install.sh` or the `sed | sudo tee` step) — `deploy-pi.sh` copies files and restarts, but doesn't reinstall the unit.
 

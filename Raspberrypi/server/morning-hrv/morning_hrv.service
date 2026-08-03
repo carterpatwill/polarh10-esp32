@@ -6,9 +6,10 @@ Wants=bluetooth.target
 [Service]
 Type=simple
 User=__USER__
-WorkingDirectory=__DIR__
+# WorkingDirectory is the server/ parent so hr_data.db + the shared .venv resolve.
+WorkingDirectory=__ROOT__
 Environment=PYTHONUNBUFFERED=1
-ExecStart=__DIR__/.venv/bin/python3 __DIR__/morning_hrv.py watch
+ExecStart=__ROOT__/.venv/bin/python3 __ROOT__/morning-hrv/morning_hrv.py watch
 Restart=on-failure
 RestartSec=15
 

@@ -5,10 +5,11 @@ After=network.target
 [Service]
 Type=simple
 User=__USER__
-WorkingDirectory=__DIR__
+# WorkingDirectory is the server/ parent so hr_data.db + the shared .venv resolve.
+WorkingDirectory=__ROOT__
 Environment=PYTHONUNBUFFERED=1
-EnvironmentFile=__DIR__/mqtt.env
-ExecStart=__DIR__/.venv/bin/python3 __DIR__/server.py
+EnvironmentFile=__ROOT__/workout-daq/mqtt.env
+ExecStart=__ROOT__/.venv/bin/python3 __ROOT__/workout-daq/server.py
 Restart=on-failure
 RestartSec=5
 

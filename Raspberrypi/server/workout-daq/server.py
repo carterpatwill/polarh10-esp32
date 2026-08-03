@@ -36,7 +36,9 @@ MQTT_TOPIC_ACK     = os.environ.get("MQTT_TOPIC_ACK",     "polar/ack")         #
 
 HEARTBEAT_S = 5   # publish pi/status this often
 
-DB_PATH = Path(__file__).parent / "hr_data.db"
+# hr_data.db lives in the server/ parent (shared with morning-hrv + the dashboard);
+# this file now sits in server/workout-daq/. HR_DB overrides.
+DB_PATH = Path(os.environ.get("HR_DB", Path(__file__).parent.parent / "hr_data.db"))
 
 # Live state shared with the heartbeat thread.
 current_session_id = None            # id of the session we're actively ingesting (heartbeat/legacy)

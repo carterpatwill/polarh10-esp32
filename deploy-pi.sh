@@ -19,17 +19,21 @@ echo "→ Copying $SRC to $PI_HOST:$PI_DIR ..."
 rsync -av --exclude '.venv' --exclude 'hr_data.db' --exclude 'mqtt.env' \
       "$SRC" "$PI_HOST:$PI_DIR/"
 
-echo "→ Installing deps + restarting service on the Pi ..."
+echo "→ Installing deps + restarting services on the Pi ..."
+# server/ holds two apps in subfolders (workout-daq/, morning-hrv/) sharing one
+# .venv + hr_data.db at the parent; restart whichever units are installed.
 ssh "$PI_HOST" bash -s <<EOF
 set -e
 cd $PI_DIR
 if [ -d .venv ]; then .venv/bin/pip install -q -r requirements.txt; fi
-if systemctl list-unit-files | grep -q '^server.service'; then
-    sudo systemctl restart server
-    echo "  server restarted."
-else
-    echo "  (service not installed yet — run ./install.sh on the Pi once)"
-fi
+for unit in server morning-hrv; do
+    if systemctl list-unit-files | grep -q "^\${unit}.service"; then
+        sudo systemctl restart "\$unit"
+        echo "  \$unit restarted."
+    else
+        echo "  (\$unit not installed yet — run ./install.sh on the Pi once)"
+    fi
+done
 EOF
 
 echo "✓ Done."
